@@ -268,9 +268,32 @@ class VerifyView(discord.ui.View):
 @bot.event
 async def on_ready():
     bot.add_view(VerifyView())
+    # Instant slash visibility: sync per-guild (global can lag up to ~1h in the client)
     try:
-        synced = await bot.tree.sync()
-        print(f"[GH] logged in as {bot.user} | synced {len(synced)} commands")
+        # optional single guild via env
+        only = os.getenv("GUILD_ID", "").strip()
+        if only.isdigit():
+            g = discord.Object(id=int(only))
+            bot.tree.copy_global_to(guild=g)
+            synced = await bot.tree.sync(guild=g)
+            print(f"[GH] logged in as {bot.user} | guild {only} synced {len(synced)} commands")
+        else:
+            total = 0
+            for guild in bot.guilds:
+                try:
+                    bot.tree.copy_global_to(guild=guild)
+                    synced = await bot.tree.sync(guild=guild)
+                    total += len(synced)
+                    print(f"[GH] guild sync {guild.name} ({guild.id}): {len(synced)} cmds")
+                except Exception as ge:
+                    print(f"[GH] guild sync fail {guild.id}: {ge}")
+            # still publish global in background
+            try:
+                gsync = await bot.tree.sync()
+                print(f"[GH] global sync {len(gsync)} commands | per-guild total refs {total}")
+            except Exception as ge:
+                print(f"[GH] global sync error: {ge}")
+            print(f"[GH] logged in as {bot.user}")
     except Exception as e:
         print(f"[GH] sync error: {e}")
 
@@ -390,64 +413,58 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
 
 
 async def setup_persist_messages():
-    """Post verify + react messages once; keep IDs in data.json."""
-    # Verify
+    """Delete previous verify/react messages (if any), then post fresh ones on each start."""
+
+    async def _delete_old(channel_id: int, message_id) -> None:
+        if not message_id:
+            return
+        try:
+            ch = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+            if not isinstance(ch, discord.TextChannel):
+                return
+            msg = await ch.fetch_message(int(message_id))
+            await msg.delete()
+            print(f"[GH] deleted old message {message_id} in {channel_id}")
+        except discord.NotFound:
+            pass
+        except Exception as e:
+            print(f"[GH] delete old message fail {message_id}: {e}")
+
+    # --- Verify ---
     try:
+        await _delete_old(VERIFY_CHANNEL_ID, DATA.get("verify_message_id"))
         vch = bot.get_channel(VERIFY_CHANNEL_ID) or await bot.fetch_channel(VERIFY_CHANNEL_ID)
         if isinstance(vch, discord.TextChannel):
-            mid = DATA.get("verify_message_id")
-            exists = False
-            if mid:
-                try:
-                    await vch.fetch_message(int(mid))
-                    exists = True
-                except Exception:
-                    exists = False
-            if not exists:
-                embed = discord.Embed(
-                    title="Verification",
-                    description=(
-                        "Click **Verify** to open a private ticket and accept the TOS / rules.\n"
-                        f"Rules: <#{RULES_CHANNEL_ID}>"
-                    ),
-                    color=0xC9A227,
-                )
-                msg = await vch.send(embed=embed, view=VerifyView())
-                DATA["verify_message_id"] = msg.id
-                save_data(DATA)
-                print("[GH] verify message posted")
+            embed = discord.Embed(
+                title="Verification",
+                description=(
+                    "Click **Verify** to open a private ticket and accept the TOS / rules.\n"
+                    f"Rules: <#{RULES_CHANNEL_ID}>"
+                ),
+                color=0xC9A227,
+            )
+            msg = await vch.send(embed=embed, view=VerifyView())
+            DATA["verify_message_id"] = msg.id
+            save_data(DATA)
+            print(f"[GH] verify message posted ({msg.id})")
     except Exception as e:
         print(f"[GH] verify setup: {e}")
 
-    # React roles
+    # --- React roles ---
     try:
+        await _delete_old(REACT_CHANNEL_ID, DATA.get("react_message_id"))
         rch = bot.get_channel(REACT_CHANNEL_ID) or await bot.fetch_channel(REACT_CHANNEL_ID)
         if isinstance(rch, discord.TextChannel):
-            mid = DATA.get("react_message_id")
-            exists = False
-            if mid:
-                try:
-                    m = await rch.fetch_message(int(mid))
-                    exists = True
-                    # ensure bot reactions
-                    for e in ("📢", "🎮"):
-                        try:
-                            await m.add_reaction(e)
-                        except Exception:
-                            pass
-                except Exception:
-                    exists = False
-            if not exists:
-                text = (
-                    "React with 📢 if you want to be pinged when **Greedy Hudzell** updates\n"
-                    "React with 🎮 if you want to be pinged when **Parkour Legacy** updates!"
-                )
-                msg = await rch.send(text)
-                await msg.add_reaction("📢")
-                await msg.add_reaction("🎮")
-                DATA["react_message_id"] = msg.id
-                save_data(DATA)
-                print("[GH] react message posted")
+            content = (
+                "React with 📢 if you want to be pinged when **Greedy Hudzell** updates\n"
+                "React with 🎮 if you want to be pinged when **Parkour Legacy** updates!"
+            )
+            msg = await rch.send(content)
+            await msg.add_reaction("📢")
+            await msg.add_reaction("🎮")
+            DATA["react_message_id"] = msg.id
+            save_data(DATA)
+            print(f"[GH] react message posted ({msg.id})")
     except Exception as e:
         print(f"[GH] react setup: {e}")
 
