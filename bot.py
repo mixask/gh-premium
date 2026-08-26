@@ -26,7 +26,6 @@ ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 STATUS_CHANNEL_ID = int(os.getenv("STATUS_CHANNEL_ID", "1472311662307574025"))
 
-# Hardcoded owner (full perms on all commands)
 DEFAULT_OWNERS = {1332400034892873761}
 
 
@@ -48,6 +47,26 @@ STATUS_MAP = {
     "testing": "🟠-testing",
     "working": "🟢-working",
     "possible_ban": "🔵-possible-ban",
+}
+
+# Browser-like headers to reduce Cloudflare blocks
+BROWSER_HEADERS = {
+    "Content-Type": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
 }
 
 intents = discord.Intents.default()
@@ -85,19 +104,38 @@ def is_seller(member: discord.Member) -> bool:
 async def api(method: str, path: str, payload: Optional[dict] = None) -> tuple[int, dict]:
     url = f"{API_BASE}{path}"
     headers = {
-        "Content-Type": "application/json",
+        **BROWSER_HEADERS,
         "Authorization": f"Bearer {ADMIN_SECRET}",
+        "Referer": API_BASE + "/",
+        "Origin": API_BASE,
     }
     timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+
+    connector = aiohttp.TCPConnector(ssl=False)  # skip SSL verify if CF causes issues
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         async with session.request(method, url, json=payload, headers=headers) as resp:
+            raw = await resp.text()
+
+            # Cloudflare challenge page detection
+            if resp.status in (403, 503) and ("Just a moment" in raw or "cf-browser-verification" in raw):
+                return resp.status, {
+                    "success": False,
+                    "reason": (
+                        "Cloudflare blocked the request. "
+                        "Ask the site owner to whitelist your bot's IP, "
+                        "or set API_BASE to a CF-bypass endpoint."
+                    ),
+                }
+
             try:
-                data = await resp.json(content_type=None)
+                import json
+                data = json.loads(raw)
             except Exception:
-                text = await resp.text()
-                data = {"success": False, "reason": f"bad_response: {text[:200]}"}
+                data = {"success": False, "reason": f"bad_response: {raw[:200]}"}
+
             if not isinstance(data, dict):
                 data = {"success": False, "reason": "invalid_json_body"}
+
             return resp.status, data
 
 
