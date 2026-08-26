@@ -307,7 +307,7 @@ async def on_ready():
 @bot.event
 async def on_member_join(member: discord.Member):
     role = member.guild.get_role(AUTO_ROLE_ID)
-    if role:
+    if role and role not in member.roles:
         try:
             await member.add_roles(role, reason="Auto role on join")
         except Exception as e:
@@ -332,18 +332,31 @@ async def on_message(message: discord.Message):
         return
 
     if text in YES_WORDS or any(text.startswith(w + " ") for w in YES_WORDS):
-        role = message.guild.get_role(VERIFIED_ROLE_ID)
-        if role:
-            try:
-                await message.author.add_roles(role, reason="Agreed to TOS")
-            except Exception as e:
-                await message.channel.send(f"Could not add role: `{e}`")
-                return
+        # already done?
+        if (DATA.get("pending_tickets") or {}).get(str(message.channel.id), {}).get("verified"):
+            return
+        verified = message.guild.get_role(VERIFIED_ROLE_ID)
+        unverified = message.guild.get_role(AUTO_ROLE_ID)
+        try:
+            to_add = []
+            to_remove = []
+            if verified and verified not in message.author.roles:
+                to_add.append(verified)
+            if unverified and unverified in message.author.roles:
+                to_remove.append(unverified)
+            if to_add:
+                await message.author.add_roles(*to_add, reason="Agreed to TOS")
+            if to_remove:
+                await message.author.remove_roles(*to_remove, reason="Verified — remove unverified")
+        except Exception as e:
+            await message.channel.send(f"Could not update roles: `{e}`")
+            return
+        DATA["pending_tickets"][str(message.channel.id)]["verified"] = True
+        DATA["pending_tickets"][str(message.channel.id)]["close_at"] = int(time.time()) + 30 * 60
+        save_data(DATA)
         await message.channel.send(
             f"{message.author.mention} verified. This ticket will close in **30 minutes**."
         )
-        DATA["pending_tickets"][str(message.channel.id)]["close_at"] = int(time.time()) + 30 * 60
-        save_data(DATA)
         return
 
     if text in NO_WORDS or any(text.startswith(w + " ") for w in NO_WORDS):
@@ -378,7 +391,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if not role_id:
         return
     role = guild.get_role(role_id)
-    if role:
+    if role and role not in member.roles:
         try:
             await member.add_roles(role, reason="Reaction role")
         except Exception as e:
