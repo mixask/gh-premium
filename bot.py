@@ -8,7 +8,6 @@ Env:
   ADMIN_ROLE_IDS        optional
   SELLER_ROLE_IDS       optional
   OWNER_USER_IDS        optional
-  GUILD_ID              optional — if set, slash cmds sync guild-only (recommended)
   GITHUB_TOKEN          optional (higher rate limit for update watcher)
 """
 
@@ -53,7 +52,6 @@ DATA_PATH = Path(os.getenv("DATA_PATH", "data.json"))
 STATUS_MAP = {
     "down": "🔴-down",
     "testing": "🟠-testing",
-    "partial": "🟡-partially-working",
     "working": "🟢-working",
     "possible_ban": "🔵-possible-ban",
 }
@@ -146,6 +144,14 @@ def is_admin(member: discord.Member) -> bool:
     if ADMIN_ROLE_IDS and roles & ADMIN_ROLE_IDS:
         return True
     return False
+
+
+def is_verified(member: discord.Member) -> bool:
+    """Server TOS/verify role required to use the script (self-service keys)."""
+    if is_admin(member):
+        return True
+    roles = _member_role_ids(member)
+    return VERIFIED_ROLE_ID in roles
 
 
 def is_seller(member: discord.Member) -> bool:
@@ -258,9 +264,7 @@ class VerifyView(discord.ui.View):
         await channel.send(
             f"{member.mention}\n"
             f"Do you agree to our {rules}, **TOS** and **Privacy Policy**?\n"
-            f"Reply with **yes** / **no** (or agree / decline).\n"
-            f"Staff can close with the button or `/close`.",
-            view=TicketCloseView(),
+            f"Reply with **yes** / **no** (or agree / decline)."
         )
         await interaction.response.send_message(
             f"Ticket created: {channel.mention}",
@@ -268,122 +272,36 @@ class VerifyView(discord.ui.View):
         )
 
 
-
-class TicketCloseView(discord.ui.View):
-    """Persistent close button for verify tickets."""
-
-    def __init__(self) -> None:
-        super().__init__(timeout=None)
-
-    @discord.ui.button(
-        label="Close ticket",
-        style=discord.ButtonStyle.danger,
-        custom_id="gh:ticket:close",
-        emoji="🔒",
-    )
-    async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Server only.", ephemeral=True)
-            return
-        if not isinstance(interaction.channel, discord.TextChannel):
-            await interaction.response.send_message("Not a text channel.", ephemeral=True)
-            return
-
-        meta = (DATA.get("pending_tickets") or {}).get(str(interaction.channel.id))
-        is_owner = bool(meta and int(meta.get("user_id", 0)) == interaction.user.id)
-        if not is_owner and not is_admin(interaction.user):
-            await interaction.response.send_message(
-                "Only the ticket owner or staff can close.", ephemeral=True
-            )
-            return
-
-        await interaction.response.send_message("Closing ticket in 3s…", ephemeral=True)
-        DATA.get("pending_tickets", {}).pop(str(interaction.channel.id), None)
-        save_data(DATA)
-        await asyncio.sleep(3)
-        try:
-            await interaction.channel.delete(reason=f"Ticket closed by {interaction.user}")
-        except Exception as e:
-            try:
-                await interaction.followup.send(f"Delete failed: `{e}`", ephemeral=True)
-            except Exception:
-                pass
-
-
-async def close_ticket_channel(
-    channel: discord.TextChannel, closer: discord.abc.User, reason: str = "closed"
-) -> None:
-    DATA.get("pending_tickets", {}).pop(str(channel.id), None)
-    save_data(DATA)
-    try:
-        await channel.send(f"Ticket {reason} by {closer.mention}. Deleting in 3s…")
-    except Exception:
-        pass
-    await asyncio.sleep(3)
-    try:
-        await channel.delete(reason=f"Ticket {reason} by {closer}")
-    except Exception as e:
-        print(f"[GH] ticket delete fail: {e}")
-
-
 # -------------------- Events --------------------
-# Prevent duplicate slash registration when Discord reconnects
-_slash_synced = False
-
-
-async def sync_slash_commands(*, force: bool = False) -> str:
-    """
-    Sync slash commands without stacking.
-
-    Discord shows duplicates when the same command exists both
-    as a global command AND as a guild command. We pick ONE mode:
-
-    - If GUILD_ID is set: guild-only (clear global, copy to that guild, sync guild)
-    - Else: global-only (clear per-guild copies in connected guilds, sync global)
-    """
-    global _slash_synced
-    if _slash_synced and not force:
-        return "already_synced"
-
-    only = os.getenv("GUILD_ID", "").strip()
-    lines: list[str] = []
-
-    if only.isdigit():
-        g = discord.Object(id=int(only))
-        # Remove global commands so client does not show global+guild doubles
-        bot.tree.clear_commands(guild=None)
-        await bot.tree.sync()
-        # Fresh guild command set
-        bot.tree.clear_commands(guild=g)
-        bot.tree.copy_global_to(guild=g)
-        synced = await bot.tree.sync(guild=g)
-        lines.append(f"guild {only}: {len(synced)} commands (global cleared)")
-        print(f"[GH] slash sync guild-only {only}: {len(synced)} cmds")
-    else:
-        # Global only — clear guild-scoped copies to avoid stacking
-        for guild in list(bot.guilds):
-            try:
-                bot.tree.clear_commands(guild=guild)
-                await bot.tree.sync(guild=guild)
-                lines.append(f"cleared guild {guild.id}")
-            except Exception as ge:
-                lines.append(f"clear guild {guild.id} fail: {ge}")
-                print(f"[GH] clear guild cmds fail {guild.id}: {ge}")
-        synced = await bot.tree.sync()
-        lines.append(f"global: {len(synced)} commands")
-        print(f"[GH] slash sync global-only: {len(synced)} cmds")
-
-    _slash_synced = True
-    return "; ".join(lines)
-
-
 @bot.event
 async def on_ready():
     bot.add_view(VerifyView())
-    bot.add_view(TicketCloseView())
+    # Instant slash visibility: sync per-guild (global can lag up to ~1h in the client)
     try:
-        result = await sync_slash_commands(force=False)
-        print(f"[GH] logged in as {bot.user} | slash: {result}")
+        # optional single guild via env
+        only = os.getenv("GUILD_ID", "").strip()
+        if only.isdigit():
+            g = discord.Object(id=int(only))
+            bot.tree.copy_global_to(guild=g)
+            synced = await bot.tree.sync(guild=g)
+            print(f"[GH] logged in as {bot.user} | guild {only} synced {len(synced)} commands")
+        else:
+            total = 0
+            for guild in bot.guilds:
+                try:
+                    bot.tree.copy_global_to(guild=guild)
+                    synced = await bot.tree.sync(guild=guild)
+                    total += len(synced)
+                    print(f"[GH] guild sync {guild.name} ({guild.id}): {len(synced)} cmds")
+                except Exception as ge:
+                    print(f"[GH] guild sync fail {guild.id}: {ge}")
+            # still publish global in background
+            try:
+                gsync = await bot.tree.sync()
+                print(f"[GH] global sync {len(gsync)} commands | per-guild total refs {total}")
+            except Exception as ge:
+                print(f"[GH] global sync error: {ge}")
+            print(f"[GH] logged in as {bot.user}")
     except Exception as e:
         print(f"[GH] sync error: {e}")
 
@@ -676,6 +594,64 @@ async def before_cleaner():
 
 
 # -------------------- Commands --------------------
+
+@bot.tree.command(name="getkey", description="Get your own key (Discord verified + Roblox username)")
+@app_commands.describe(
+    username="Your exact Roblox username (key binds to this account)",
+    plan="Length (free self-service is day only unless seller)",
+)
+@app_commands.choices(
+    plan=[
+        app_commands.Choice(name="day (24h)", value="day"),
+    ]
+)
+async def cmd_getkey(
+    interaction: discord.Interaction,
+    username: str,
+    plan: app_commands.Choice[str],
+):
+    """Self-service: must have verified role in this Discord."""
+    if not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Use this in the server.", ephemeral=True)
+        return
+    if not is_verified(interaction.user):
+        await interaction.response.send_message(
+            "You must **verify** in Discord first (Verify channel → agree to TOS), "
+            "then run `/getkey` again.\n"
+            f"Server: https://discord.gg/sbVuaT9a2T",
+            ephemeral=True,
+        )
+        return
+    if not ADMIN_SECRET:
+        await interaction.response.send_message("ADMIN_SECRET not set on host.", ephemeral=True)
+        return
+    uname = (username or "").strip()
+    if not uname or len(uname) < 3:
+        await interaction.response.send_message("Enter a valid Roblox username.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    payload = {"plan": plan.value, "username": uname}
+    status, data = await api("POST", "/admin/generate", payload)
+    if not data.get("success"):
+        await interaction.followup.send(f"Failed ({status}): `{data.get('reason', data)}`", ephemeral=True)
+        return
+    # remember last claim for rate-limit optional
+    DATA.setdefault("discord_claims", {})[str(interaction.user.id)] = {
+        "username": uname,
+        "key": data.get("key"),
+        "ts": int(time.time()),
+    }
+    save_data(DATA)
+    await interaction.followup.send(
+        f"**Your key** (bound to Roblox `{uname}`)\n"
+        f"```{data.get('key')}```\n"
+        f"Plan: `{data.get('plan')}` · expires unix `{data.get('expires_at')}`\n"
+        f"Paste this key in the Greedy loader in-game.\n"
+        f"_Do not share — it is tied to your Roblox name._",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="key", description="Generate a Greedy Hudzell key")
 @app_commands.describe(plan="Subscription length", username="Optional Roblox username to bind now")
 @app_commands.choices(
@@ -710,7 +686,8 @@ async def cmd_key(
         f"Plan: `{data.get('plan')}`\n"
         f"Expires (unix): `{data.get('expires_at')}`\n"
         f"Username: `{data.get('username') or 'pending'}`\n"
-        f"Pending: `{data.get('pending')}`"
+        f"Pending: `{data.get('pending')}`\n\n"
+        f"_Users should be Discord-verified and use the same Roblox name as bound._"
     )
     await interaction.followup.send(msg, ephemeral=True)
 
@@ -742,7 +719,6 @@ async def cmd_renew(interaction: discord.Interaction, key: str, days: app_comman
     state=[
         app_commands.Choice(name="🔴 down", value="down"),
         app_commands.Choice(name="🟠 testing", value="testing"),
-        app_commands.Choice(name="🟡 partially working", value="partial"),
         app_commands.Choice(name="🟢 working", value="working"),
         app_commands.Choice(name="🔵 possible ban", value="possible_ban"),
     ]
@@ -849,179 +825,6 @@ async def cmd_whitelist(
             DATA["key_whitelist"] = wl
             save_data(DATA)
         await interaction.response.send_message(f"Removed {user.mention} from key whitelist.", ephemeral=True)
-
-
-
-@bot.tree.command(name="revoke", description="Revoke a Greedy Hudzell key")
-@app_commands.describe(key="Full key to revoke")
-async def cmd_revoke(interaction: discord.Interaction, key: str):
-    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
-        await interaction.response.send_message("Admin only.", ephemeral=True)
-        return
-    if not ADMIN_SECRET:
-        await interaction.response.send_message("ADMIN_SECRET not set on host.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    status, data = await api("POST", "/admin/revoke", {"key": key.strip()})
-    if not data.get("success"):
-        await interaction.followup.send(
-            f"Failed ({status}): `{data.get('reason', data)}`",
-            ephemeral=True,
-        )
-        return
-    await interaction.followup.send(f"**Revoked** `{key.strip()}`", ephemeral=True)
-
-
-@bot.tree.command(name="rewire", description="Change key username (GH-PAID; owner = any key)")
-@app_commands.describe(key="Key to rewire", username="New Roblox username")
-async def cmd_rewire(interaction: discord.Interaction, key: str, username: str):
-    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
-        await interaction.response.send_message("Admin only.", ephemeral=True)
-        return
-    if not ADMIN_SECRET:
-        await interaction.response.send_message("ADMIN_SECRET not set on host.", ephemeral=True)
-        return
-    key = key.strip()
-    username = username.strip()
-    # Owners (DEFAULT_OWNERS includes 1332400034892873761) may rewire any key
-    allow_any = is_owner(interaction.user)
-    if not allow_any and not key.startswith("GH-PAID-"):
-        await interaction.response.send_message(
-            "Rewire is only allowed for **GH-PAID-*** keys.\n(Owner can rewire any key.)",
-            ephemeral=True,
-        )
-        return
-    if len(username) < 3 or len(username) > 20 or not re.match(r"^[A-Za-z0-9_]+$", username):
-        await interaction.response.send_message(
-            "Invalid username (3–20 chars: letters, numbers, `_`).",
-            ephemeral=True,
-        )
-        return
-    await interaction.response.defer(ephemeral=True)
-    status, data = await api(
-        "POST",
-        "/admin/rewire",
-        {"key": key, "username": username, "force": allow_any},
-    )
-    if not data.get("success"):
-        await interaction.followup.send(
-            f"Failed ({status}): `{data.get('reason', data.get('details', data))}`",
-            ephemeral=True,
-        )
-        return
-    await interaction.followup.send(
-        f"**Rewired** `{data.get('key')}`\n"
-        f"Previous: `{data.get('previous_username')}` → **`{data.get('username')}`**\n"
-        f"Plan: `{data.get('plan')}` · expires `{data.get('expires_at')}`",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="stats", description="Key issuance stats (day / week)")
-async def cmd_stats(interaction: discord.Interaction):
-    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
-        await interaction.response.send_message("Admin only.", ephemeral=True)
-        return
-    if not ADMIN_SECRET:
-        await interaction.response.send_message("ADMIN_SECRET not set on host.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    status, data = await api("GET", "/admin/stats")
-    if status >= 400 and not data.get("success"):
-        await interaction.followup.send(
-            f"Failed ({status}): `{data.get('reason', data)}`",
-            ephemeral=True,
-        )
-        return
-    await interaction.followup.send(
-        "**Key stats**\n"
-        f"Issued **today**: `{data.get('issued_day', 0)}` (paid `{data.get('paid_day', 0)}`)\n"
-        f"Issued **7d**: `{data.get('issued_week', 0)}` (paid `{data.get('paid_week', 0)}`)\n"
-        f"Active: `{data.get('active', 0)}` · Revoked: `{data.get('revoked', 0)}` · Total: `{data.get('total', 0)}`\n"
-        f"Paid active: `{data.get('paid_active', 0)}` / paid total `{data.get('paid_total', 0)}`",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="close", description="Close the current verify ticket")
-async def cmd_close(interaction: discord.Interaction):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("Server only.", ephemeral=True)
-        return
-    if not isinstance(interaction.channel, discord.TextChannel):
-        await interaction.response.send_message("Not a text channel.", ephemeral=True)
-        return
-
-    meta = (DATA.get("pending_tickets") or {}).get(str(interaction.channel.id))
-    is_owner = bool(meta and int(meta.get("user_id", 0)) == interaction.user.id)
-    in_ticket = meta is not None
-    if not in_ticket and not is_admin(interaction.user):
-        await interaction.response.send_message("This is not a verify ticket.", ephemeral=True)
-        return
-    if in_ticket and not is_owner and not is_admin(interaction.user):
-        await interaction.response.send_message(
-            "Only the ticket owner or staff can close.", ephemeral=True
-        )
-        return
-
-    await interaction.response.send_message("Closing…", ephemeral=True)
-    await close_ticket_channel(interaction.channel, interaction.user, reason="closed")
-
-
-@bot.tree.command(name="announce", description="Post an embed to the updates channel")
-@app_commands.describe(
-    title="Embed title",
-    message="Embed body",
-    ping_updates="Ping GH Updates role",
-)
-async def cmd_announce(
-    interaction: discord.Interaction,
-    title: str,
-    message: str,
-    ping_updates: bool = False,
-):
-    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
-        await interaction.response.send_message("Admin only.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    ch = bot.get_channel(UPDATES_CHANNEL_ID)
-    if ch is None:
-        try:
-            ch = await bot.fetch_channel(UPDATES_CHANNEL_ID)
-        except Exception:
-            ch = None
-    if not isinstance(ch, discord.TextChannel):
-        await interaction.followup.send(
-            f"Updates channel `{UPDATES_CHANNEL_ID}` not found.", ephemeral=True
-        )
-        return
-
-    embed = discord.Embed(
-        title=title[:256],
-        description=message[:4000],
-        color=0xC9A227,
-    )
-    embed.set_footer(text=f"Announced by {interaction.user}")
-    content = f"<@&{ROLE_GH_UPDATES}>" if ping_updates else None
-    try:
-        await ch.send(content=content, embed=embed)
-    except Exception as e:
-        await interaction.followup.send(f"Send failed: `{e}`", ephemeral=True)
-        return
-    await interaction.followup.send(f"Posted in {ch.mention}", ephemeral=True)
-
-
-@bot.tree.command(name="sync_commands", description="Re-sync slash commands (fix stacking; admin)")
-async def cmd_sync_commands(interaction: discord.Interaction):
-    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
-        await interaction.response.send_message("Admin only.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    try:
-        result = await sync_slash_commands(force=True)
-        await interaction.followup.send(f"Slash sync done.\n`{result}`", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"Sync failed: `{e}`", ephemeral=True)
 
 
 @bot.tree.command(name="setup_messages", description="Force re-post verify/react messages (admin)")
