@@ -35,6 +35,7 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 STATUS_CHANNEL_ID = int(os.getenv("STATUS_CHANNEL_ID", "1472311662307574025"))
 AUTO_ROLE_ID = int(os.getenv("AUTO_ROLE_ID", "1448728578844786978"))
 VERIFY_CHANNEL_ID = int(os.getenv("VERIFY_CHANNEL_ID", "1424116614856441856"))
+LICENSE_PANEL_CHANNEL_ID = int(os.getenv("LICENSE_PANEL_CHANNEL_ID", "0") or 0)
 VERIFY_CATEGORY_ID = int(os.getenv("VERIFY_CATEGORY_ID", "1453098727253479526"))
 VERIFIED_ROLE_ID = int(os.getenv("VERIFIED_ROLE_ID", "1445500571640402052"))
 RULES_CHANNEL_ID = int(os.getenv("RULES_CHANNEL_ID", "1424116614856441856"))
@@ -191,7 +192,148 @@ async def api(method: str, path: str, payload: Optional[dict] = None) -> tuple[i
             return resp.status, data
 
 
-# -------------------- Verify UI --------------------
+
+# -------------------- License activate / rewire (keys start inactive) --------------------
+class LicenseVerifyModal(discord.ui.Modal, title="Activate license key"):
+    key = discord.ui.TextInput(
+        label="License key",
+        placeholder="GH-XXXX-XXXX-XXXX",
+        min_length=8,
+        max_length=64,
+        required=True,
+    )
+    roblox = discord.ui.TextInput(
+        label="Roblox username",
+        placeholder="Exact account name",
+        min_length=3,
+        max_length=20,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        key = str(self.key.value).strip()
+        username = str(self.roblox.value).strip()
+        if not re.match(r"^[A-Za-z0-9_]+$", username):
+            await interaction.followup.send("Invalid Roblox username.", ephemeral=True)
+            return
+        status, data = await api(
+            "POST",
+            "/api/discord/verify-key",
+            {
+                "key": key,
+                "roblox_username": username,
+                "username": username,
+                "discord_id": str(interaction.user.id),
+            },
+        )
+        if not data.get("ok"):
+            err = data.get("error") or data.get("reason") or data.get("message") or data
+            await interaction.followup.send(f"Activate failed: `{err}`", ephemeral=True)
+            return
+        role_note = ""
+        if interaction.guild and isinstance(interaction.user, discord.Member):
+            role = interaction.guild.get_role(VERIFIED_ROLE_ID)
+            if role and role not in interaction.user.roles:
+                try:
+                    await interaction.user.add_roles(role, reason="License activated")
+                    role_note = "\nMember role granted."
+                except Exception as e:
+                    role_note = f"\nRole: `{e}`"
+        await interaction.followup.send(
+            f"**Key activated**\n"
+            f"Plan: `{data.get('plan', '?')}`\n"
+            f"Expires: `{data.get('expires_at', '?')}`\n"
+            f"Roblox: `{username}`"
+            f"{role_note}",
+            ephemeral=True,
+        )
+
+
+class LicenseRewireModal(discord.ui.Modal, title="Rewire key (paid only)"):
+    key = discord.ui.TextInput(
+        label="License key",
+        placeholder="GH-XXXX-XXXX-XXXX",
+        min_length=8,
+        max_length=64,
+        required=True,
+    )
+    roblox = discord.ui.TextInput(
+        label="New Roblox username",
+        placeholder="Account to bind",
+        min_length=3,
+        max_length=20,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        key = str(self.key.value).strip()
+        username = str(self.roblox.value).strip()
+        if not re.match(r"^[A-Za-z0-9_]+$", username):
+            await interaction.followup.send("Invalid Roblox username.", ephemeral=True)
+            return
+        status, data = await api(
+            "POST",
+            "/api/discord/rewire",
+            {
+                "key": key,
+                "roblox_username": username,
+                "username": username,
+                "discord_id": str(interaction.user.id),
+            },
+        )
+        if not data.get("ok"):
+            err = data.get("error") or data.get("reason") or data.get("message") or data
+            await interaction.followup.send(f"Rewire failed: `{err}`", ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"**Rewired** `{data.get('previous_username', '?')}` → `{username}`\n"
+            f"Plan: `{data.get('plan', '?')}`",
+            ephemeral=True,
+        )
+
+
+class LicensePanelView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Verify key",
+        style=discord.ButtonStyle.success,
+        custom_id="clientlink:license:verify",
+    )
+    async def license_verify(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(LicenseVerifyModal())
+
+    @discord.ui.button(
+        label="Rewire (paid)",
+        style=discord.ButtonStyle.primary,
+        custom_id="clientlink:license:rewire",
+    )
+    async def license_rewire(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(LicenseRewireModal())
+
+
+def license_panel_embed() -> discord.Embed:
+    e = discord.Embed(
+        title="License panel",
+        description=(
+            "**Verify key** — activate a license (keys start **inactive**).\n"
+            "Links your Discord + Roblox to the key.\n\n"
+            "**Rewire (paid)** — move week/month/year key to another Roblox name.\n\n"
+            "1. Get a key\n"
+            "2. Press **Verify key**\n"
+            "3. Enter key + Roblox username\n"
+            "4. Use the loader in-game on that account"
+        ),
+        color=0xD4AF37,
+    )
+    e.set_footer(text="Do not share your key")
+    return e
+
+
+# -------------------- Verify UI (server TOS tickets) --------------------
 class VerifyView(discord.ui.View):
     def __init__(self) -> None:
         super().__init__(timeout=None)
@@ -276,6 +418,7 @@ class VerifyView(discord.ui.View):
 @bot.event
 async def on_ready():
     bot.add_view(VerifyView())
+    bot.add_view(LicensePanelView())
     # Instant slash visibility: sync per-guild (global can lag up to ~1h in the client)
     try:
         # optional single guild via env
@@ -306,6 +449,7 @@ async def on_ready():
         print(f"[GH] sync error: {e}")
 
     await setup_persist_messages()
+    await setup_license_panel()
     if not github_watcher.is_running():
         github_watcher.start()
     if not ticket_cleaner.is_running():
@@ -432,6 +576,35 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
         except Exception:
             pass
 
+
+
+async def setup_license_panel() -> None:
+    """Post / refresh license Verify+Rewire panel."""
+    ch_id = LICENSE_PANEL_CHANNEL_ID or 0
+    if not ch_id:
+        return
+    channel = bot.get_channel(ch_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(ch_id)
+        except Exception as e:
+            print(f"[GH] license panel channel: {e}")
+            return
+    if not isinstance(channel, discord.TextChannel):
+        return
+    try:
+        async for msg in channel.history(limit=25):
+            if msg.author == bot.user and msg.embeds:
+                title = (msg.embeds[0].title or "") if msg.embeds else ""
+                if "License panel" in title:
+                    await msg.delete()
+    except Exception as e:
+        print(f"[GH] license panel cleanup: {e}")
+    try:
+        await channel.send(embed=license_panel_embed(), view=LicensePanelView())
+        print(f"[GH] license panel posted in {ch_id}")
+    except Exception as e:
+        print(f"[GH] license panel post: {e}")
 
 async def setup_persist_messages():
     """Delete previous verify/react messages (if any), then post fresh ones on each start."""
@@ -646,7 +819,7 @@ async def cmd_getkey(
         f"**Your key** (bound to Roblox `{uname}`)\n"
         f"```{data.get('key')}```\n"
         f"Plan: `{data.get('plan')}` · expires unix `{data.get('expires_at')}`\n"
-        f"Paste this key in the Greedy loader in-game.\n"
+        f"Activate with **Verify key** on the License panel, then use the loader in-game.\n"
         f"_Do not share — it is tied to your Roblox name._",
         ephemeral=True,
     )
@@ -775,6 +948,8 @@ async def cmd_keycheck(interaction: discord.Interaction, key: str):
         f"Created: `{data.get('created_at')}`\n"
         f"Expires: `{data.get('expires_at')}`\n"
         f"Executed: `{data.get('executed')}`\n"
+        f"Activated: `{data.get('activated')}`\n"
+        f"Discord ID: `{data.get('discord_id')}`\n"
         f"Last exec: `{data.get('last_execution')}`",
         ephemeral=True,
     )
@@ -825,6 +1000,15 @@ async def cmd_whitelist(
             DATA["key_whitelist"] = wl
             save_data(DATA)
         await interaction.response.send_message(f"Removed {user.mention} from key whitelist.", ephemeral=True)
+
+
+
+@bot.tree.command(name="license_panel", description="Post license Verify/Rewire panel (admin)")
+async def cmd_license_panel(interaction: discord.Interaction):
+    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    await interaction.response.send_message(embed=license_panel_embed(), view=LicensePanelView())
 
 
 @bot.tree.command(name="setup_messages", description="Force re-post verify/react messages (admin)")
