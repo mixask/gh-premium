@@ -419,32 +419,40 @@ class VerifyView(discord.ui.View):
 async def on_ready():
     bot.add_view(VerifyView())
     bot.add_view(LicensePanelView())
-    # Instant slash visibility: sync per-guild (global can lag up to ~1h in the client)
+    # Guild-only slash sync. Global+guild = duplicate entries in Discord client.
     try:
-        # optional single guild via env
+        names = [c.name for c in bot.tree.get_commands()]
+        print(f"[GH] tree commands ({len(names)}): {', '.join(names)}")
+        if "license_panel" not in names:
+            print("[GH] WARNING: license_panel missing from tree")
+
         only = os.getenv("GUILD_ID", "").strip()
         if only.isdigit():
-            g = discord.Object(id=int(only))
-            bot.tree.copy_global_to(guild=g)
-            synced = await bot.tree.sync(guild=g)
-            print(f"[GH] logged in as {bot.user} | guild {only} synced {len(synced)} commands")
+            guilds = [discord.Object(id=int(only))]
         else:
-            total = 0
-            for guild in bot.guilds:
-                try:
-                    bot.tree.copy_global_to(guild=guild)
-                    synced = await bot.tree.sync(guild=guild)
-                    total += len(synced)
-                    print(f"[GH] guild sync {guild.name} ({guild.id}): {len(synced)} cmds")
-                except Exception as ge:
-                    print(f"[GH] guild sync fail {guild.id}: {ge}")
-            # still publish global in background
+            guilds = list(bot.guilds)
+
+        for g in guilds:
             try:
-                gsync = await bot.tree.sync()
-                print(f"[GH] global sync {len(gsync)} commands | per-guild total refs {total}")
+                bot.tree.copy_global_to(guild=g)
+                synced = await bot.tree.sync(guild=g)
+                print(
+                    f"[GH] guild sync {getattr(g, 'id', g)}: "
+                    f"{len(synced)} cmds -> {[c.name for c in synced]}"
+                )
             except Exception as ge:
-                print(f"[GH] global sync error: {ge}")
-            print(f"[GH] logged in as {bot.user}")
+                print(f"[GH] guild sync fail {getattr(g, 'id', g)}: {ge}")
+
+        # Wipe GLOBAL command list on Discord (does not clear local tree handlers)
+        try:
+            app_id = bot.application_id or (bot.user.id if bot.user else None)
+            if app_id:
+                await bot.http.bulk_upsert_global_commands(app_id, [])
+                print("[GH] global application commands wiped (no more doubles)")
+        except Exception as ge:
+            print(f"[GH] global wipe error: {ge}")
+
+        print(f"[GH] logged in as {bot.user}")
     except Exception as e:
         print(f"[GH] sync error: {e}")
 
@@ -825,7 +833,7 @@ async def cmd_getkey(
     )
 
 
-@bot.tree.command(name="key", description="Generate a Greedy Hudzell key")
+@bot.tree.command(name="key", description="Generate a license key (admin/seller)")
 @app_commands.describe(plan="Subscription length", username="Optional Roblox username to bind now")
 @app_commands.choices(
     plan=[
