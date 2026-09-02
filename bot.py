@@ -9,8 +9,9 @@ Env:
   SELLER_ROLE_IDS       optional
   OWNER_USER_IDS        optional
   GITHUB_TOKEN          optional (higher rate limit for update watcher)
+  KEY_LINK              default https://work.ink/28wp/Greedy-hudzell
+  LICENSE_PANEL_CHANNEL_ID  optional auto-post channel
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -31,7 +32,7 @@ API_BASE = os.getenv("API_BASE", "https://greedyhudzell.xyz").rstrip("/")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
-
+KEY_LINK = os.getenv("KEY_LINK", "https://work.ink/28wp/Greedy-hudzell")
 STATUS_CHANNEL_ID = int(os.getenv("STATUS_CHANNEL_ID", "1472311662307574025"))
 AUTO_ROLE_ID = int(os.getenv("AUTO_ROLE_ID", "1448728578844786978"))
 VERIFY_CHANNEL_ID = int(os.getenv("VERIFY_CHANNEL_ID", "1424116614856441856"))
@@ -43,10 +44,8 @@ REACT_CHANNEL_ID = int(os.getenv("REACT_CHANNEL_ID", "1448624840905855037"))
 ROLE_PARKOUR_ANN = int(os.getenv("ROLE_PARKOUR_ANN", "1445398639462584450"))
 ROLE_GH_UPDATES = int(os.getenv("ROLE_GH_UPDATES", "1443554745481560084"))
 UPDATES_CHANNEL_ID = int(os.getenv("UPDATES_CHANNEL_ID", "1428800296926314506"))
-
 GH_REPO = os.getenv("GH_REPO", "mixask/GH")
 WATCH_FILES = ("greedy.lua", "greedyloader.lua")
-
 DEFAULT_OWNERS = {1332400034892873761}
 DATA_PATH = Path(os.getenv("DATA_PATH", "data.json"))
 
@@ -92,11 +91,12 @@ OWNER_USER_IDS = DEFAULT_OWNERS | _parse_ids(os.getenv("OWNER_USER_IDS", ""))
 
 # -------------------- Persistence --------------------
 _default_data: dict[str, Any] = {
-    "key_whitelist": [],          # user ids allowed to /key (sellers)
+    "key_whitelist": [],
     "verify_message_id": None,
     "react_message_id": None,
-    "file_sha": {},               # path -> sha
-    "pending_tickets": {},        # channel_id -> {user_id, created}
+    "file_sha": {},
+    "pending_tickets": {},
+    "discord_claims": {},
 }
 
 
@@ -124,7 +124,6 @@ intents.members = True
 intents.message_content = True
 intents.guilds = True
 intents.reactions = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
@@ -148,7 +147,6 @@ def is_admin(member: discord.Member) -> bool:
 
 
 def is_verified(member: discord.Member) -> bool:
-    """Server TOS/verify role required to use the script (self-service keys)."""
     if is_admin(member):
         return True
     roles = _member_role_ids(member)
@@ -192,8 +190,11 @@ async def api(method: str, path: str, payload: Optional[dict] = None) -> tuple[i
             return resp.status, data
 
 
+def _api_ok(data: dict) -> bool:
+    return bool(data.get("ok") or data.get("success") or data.get("valid"))
 
-# -------------------- License activate / rewire (keys start inactive) --------------------
+
+# -------------------- License activate / rewire --------------------
 class LicenseVerifyModal(discord.ui.Modal, title="Activate license key"):
     key = discord.ui.TextInput(
         label="License key",
@@ -217,6 +218,7 @@ class LicenseVerifyModal(discord.ui.Modal, title="Activate license key"):
         if not re.match(r"^[A-Za-z0-9_]+$", username):
             await interaction.followup.send("Invalid Roblox username.", ephemeral=True)
             return
+
         status, data = await api(
             "POST",
             "/api/discord/verify-key",
@@ -227,25 +229,34 @@ class LicenseVerifyModal(discord.ui.Modal, title="Activate license key"):
                 "discord_id": str(interaction.user.id),
             },
         )
-        if not data.get("ok"):
+        if not _api_ok(data):
             err = data.get("error") or data.get("reason") or data.get("message") or data
             await interaction.followup.send(f"Activate failed: `{err}`", ephemeral=True)
             return
+
+        # Member role only the first time (if missing)
         role_note = ""
         if interaction.guild and isinstance(interaction.user, discord.Member):
             role = interaction.guild.get_role(VERIFIED_ROLE_ID)
             if role and role not in interaction.user.roles:
                 try:
-                    await interaction.user.add_roles(role, reason="License activated")
-                    role_note = "\nMember role granted."
+                    await interaction.user.add_roles(role, reason="License activated (first time)")
+                    role_note = "\nMember role granted (first time)."
                 except Exception as e:
-                    role_note = f"\nRole: `{e}`"
+                    role_note = f"\nRole error: `{e}`"
+            elif role and role in interaction.user.roles:
+                role_note = "\nMember role already present."
+
+        re_note = ""
+        if data.get("reactivated"):
+            re_note = "\n_(key was already active — re-activated OK)_"
+
         await interaction.followup.send(
             f"**Key activated**\n"
             f"Plan: `{data.get('plan', '?')}`\n"
             f"Expires: `{data.get('expires_at', '?')}`\n"
             f"Roblox: `{username}`"
-            f"{role_note}",
+            f"{role_note}{re_note}",
             ephemeral=True,
         )
 
@@ -283,7 +294,7 @@ class LicenseRewireModal(discord.ui.Modal, title="Rewire key (paid only)"):
                 "discord_id": str(interaction.user.id),
             },
         )
-        if not data.get("ok"):
+        if not _api_ok(data):
             err = data.get("error") or data.get("reason") or data.get("message") or data
             await interaction.followup.send(f"Rewire failed: `{err}`", ephemeral=True)
             return
@@ -297,11 +308,20 @@ class LicenseRewireModal(discord.ui.Modal, title="Rewire key (paid only)"):
 class LicensePanelView(discord.ui.View):
     def __init__(self) -> None:
         super().__init__(timeout=None)
+        self.add_item(
+            discord.ui.Button(
+                label="Get free key",
+                style=discord.ButtonStyle.link,
+                url=KEY_LINK,
+                row=1,
+            )
+        )
 
     @discord.ui.button(
         label="Verify key",
         style=discord.ButtonStyle.success,
         custom_id="clientlink:license:verify",
+        row=0,
     )
     async def license_verify(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(LicenseVerifyModal())
@@ -310,6 +330,7 @@ class LicensePanelView(discord.ui.View):
         label="Rewire (paid)",
         style=discord.ButtonStyle.primary,
         custom_id="clientlink:license:rewire",
+        row=0,
     )
     async def license_rewire(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(LicenseRewireModal())
@@ -319,10 +340,13 @@ def license_panel_embed() -> discord.Embed:
     e = discord.Embed(
         title="License panel",
         description=(
+            "**Get free key** — open the key page (Work.ink)\n"
+            f"{KEY_LINK}\n\n"
             "**Verify key** — activate a license (keys start **inactive**).\n"
-            "Links your Discord + Roblox to the key.\n\n"
+            "You can activate **again** when you get a new key.\n"
+            "Member role is given only the **first** time.\n\n"
             "**Rewire (paid)** — move week/month/year key to another Roblox name.\n\n"
-            "1. Get a key\n"
+            "1. Get a key (button below or link)\n"
             "2. Press **Verify key**\n"
             "3. Enter key + Roblox username\n"
             "4. Use the loader in-game on that account"
@@ -348,14 +372,10 @@ class VerifyView(discord.ui.View):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Use this in the server.", ephemeral=True)
             return
-
         member = interaction.user
-        # already verified?
         if any(r.id == VERIFIED_ROLE_ID for r in member.roles):
             await interaction.response.send_message("You are already verified.", ephemeral=True)
             return
-
-        # existing ticket?
         for ch_id, meta in list((DATA.get("pending_tickets") or {}).items()):
             if int(meta.get("user_id", 0)) == member.id:
                 ch = interaction.guild.get_channel(int(ch_id))
@@ -365,7 +385,6 @@ class VerifyView(discord.ui.View):
                         ephemeral=True,
                     )
                     return
-
         category = interaction.guild.get_channel(VERIFY_CATEGORY_ID)
         overwrites = {
             interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -376,11 +395,9 @@ class VerifyView(discord.ui.View):
                 view_channel=True, send_messages=True, manage_channels=True
             ),
         }
-        # staff can see
         for role in interaction.guild.roles:
             if role.permissions.administrator or role.id in ADMIN_ROLE_IDS:
                 overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
-
         safe_name = re.sub(r"[^a-z0-9\-]", "", member.name.lower())[:20] or "user"
         try:
             channel = await interaction.guild.create_text_channel(
@@ -395,13 +412,11 @@ class VerifyView(discord.ui.View):
                 ephemeral=True,
             )
             return
-
         DATA.setdefault("pending_tickets", {})[str(channel.id)] = {
             "user_id": member.id,
             "created": int(time.time()),
         }
         save_data(DATA)
-
         rules = f"<#{RULES_CHANNEL_ID}>"
         await channel.send(
             f"{member.mention}\n"
@@ -419,19 +434,18 @@ class VerifyView(discord.ui.View):
 async def on_ready():
     bot.add_view(VerifyView())
     bot.add_view(LicensePanelView())
-    # Guild-only slash sync. Global+guild = duplicate entries in Discord client.
     try:
         names = [c.name for c in bot.tree.get_commands()]
         print(f"[GH] tree commands ({len(names)}): {', '.join(names)}")
         if "license_panel" not in names:
             print("[GH] WARNING: license_panel missing from tree")
-
+        if "rewire" not in names:
+            print("[GH] WARNING: rewire missing from tree")
         only = os.getenv("GUILD_ID", "").strip()
         if only.isdigit():
             guilds = [discord.Object(id=int(only))]
         else:
             guilds = list(bot.guilds)
-
         for g in guilds:
             try:
                 bot.tree.copy_global_to(guild=g)
@@ -442,8 +456,6 @@ async def on_ready():
                 )
             except Exception as ge:
                 print(f"[GH] guild sync fail {getattr(g, 'id', g)}: {ge}")
-
-        # Wipe GLOBAL command list on Discord (does not clear local tree handlers)
         try:
             app_id = bot.application_id or (bot.user.id if bot.user else None)
             if app_id:
@@ -451,11 +463,9 @@ async def on_ready():
                 print("[GH] global application commands wiped (no more doubles)")
         except Exception as ge:
             print(f"[GH] global wipe error: {ge}")
-
         print(f"[GH] logged in as {bot.user}")
     except Exception as e:
         print(f"[GH] sync error: {e}")
-
     await setup_persist_messages()
     await setup_license_panel()
     if not github_watcher.is_running():
@@ -480,19 +490,15 @@ async def on_message(message: discord.Message):
         return
     if not message.guild or not isinstance(message.author, discord.Member):
         return
-
     meta = (DATA.get("pending_tickets") or {}).get(str(message.channel.id))
     if not meta:
         return
     if int(meta.get("user_id", 0)) != message.author.id:
         return
-
     text = (message.content or "").strip().lower()
     if not text:
         return
-
     if text in YES_WORDS or any(text.startswith(w + " ") for w in YES_WORDS):
-        # already done?
         if (DATA.get("pending_tickets") or {}).get(str(message.channel.id), {}).get("verified"):
             return
         verified = message.guild.get_role(VERIFIED_ROLE_ID)
@@ -518,7 +524,6 @@ async def on_message(message: discord.Message):
             f"{message.author.mention} verified. This ticket will close in **30 minutes**."
         )
         return
-
     if text in NO_WORDS or any(text.startswith(w + " ") for w in NO_WORDS):
         await message.channel.send(
             "You need to agree to the TOS and rules to get access."
@@ -541,7 +546,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             member = await guild.fetch_member(payload.user_id)
         except Exception:
             return
-
     emoji = str(payload.emoji)
     role_id = None
     if emoji == "📢":
@@ -585,9 +589,7 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
             pass
 
 
-
 async def setup_license_panel() -> None:
-    """Post / refresh license Verify+Rewire panel."""
     ch_id = LICENSE_PANEL_CHANNEL_ID or 0
     if not ch_id:
         return
@@ -614,9 +616,8 @@ async def setup_license_panel() -> None:
     except Exception as e:
         print(f"[GH] license panel post: {e}")
 
-async def setup_persist_messages():
-    """Delete previous verify/react messages (if any), then post fresh ones on each start."""
 
+async def setup_persist_messages():
     async def _delete_old(channel_id: int, message_id) -> None:
         if not message_id:
             return
@@ -632,7 +633,6 @@ async def setup_persist_messages():
         except Exception as e:
             print(f"[GH] delete old message fail {message_id}: {e}")
 
-    # --- Verify ---
     try:
         await _delete_old(VERIFY_CHANNEL_ID, DATA.get("verify_message_id"))
         vch = bot.get_channel(VERIFY_CHANNEL_ID) or await bot.fetch_channel(VERIFY_CHANNEL_ID)
@@ -652,7 +652,6 @@ async def setup_persist_messages():
     except Exception as e:
         print(f"[GH] verify setup: {e}")
 
-    # --- React roles ---
     try:
         await _delete_old(REACT_CHANNEL_ID, DATA.get("react_message_id"))
         rch = bot.get_channel(REACT_CHANNEL_ID) or await bot.fetch_channel(REACT_CHANNEL_ID)
@@ -697,11 +696,9 @@ async def ticket_cleaner():
 
 @tasks.loop(minutes=3)
 async def github_watcher():
-    """Poll GitHub commits for watched files and announce updates."""
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "GreedyHudzell-Bot"}
     if GITHUB_TOKEN:
         headers["Authorization"] = f"token {GITHUB_TOKEN}"
-
     channel = bot.get_channel(UPDATES_CHANNEL_ID)
     if channel is None:
         try:
@@ -710,7 +707,6 @@ async def github_watcher():
             return
     if not isinstance(channel, discord.TextChannel):
         return
-
     timeout = aiohttp.ClientTimeout(total=25)
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
         for path in WATCH_FILES:
@@ -728,28 +724,18 @@ async def github_watcher():
                     continue
                 prev = (DATA.get("file_sha") or {}).get(path)
                 if prev is None:
-                    # first run — seed only, no announce
                     DATA.setdefault("file_sha", {})[path] = sha
                     save_data(DATA)
                     continue
                 if prev == sha:
                     continue
-
                 commit = commits[0].get("commit") or {}
                 message = (commit.get("message") or "").strip()
                 title_line = message.split("\n")[0][:120]
                 body = "\n".join(message.split("\n")[1:]).strip()
                 is_big = "big" in message.lower()
-
-                if path == "greedyloader.lua":
-                    label = "Loader"
-                else:
-                    label = "Hudzell"
-
-                ping = ""
-                if is_big:
-                    ping = f"<@&{ROLE_GH_UPDATES}>\n"
-
+                label = "Loader" if path == "greedyloader.lua" else "Hudzell"
+                ping = f"<@&{ROLE_GH_UPDATES}>\n" if is_big else ""
                 text = (
                     f"{ping}**Greedy {label} updated!**\n"
                     f"{title_line}\n"
@@ -775,7 +761,6 @@ async def before_cleaner():
 
 
 # -------------------- Commands --------------------
-
 @bot.tree.command(name="getkey", description="Get your own key (Discord verified + Roblox username)")
 @app_commands.describe(
     username="Your exact Roblox username (key binds to this account)",
@@ -791,7 +776,6 @@ async def cmd_getkey(
     username: str,
     plan: app_commands.Choice[str],
 ):
-    """Self-service: must have verified role in this Discord."""
     if not isinstance(interaction.user, discord.Member):
         await interaction.response.send_message("Use this in the server.", ephemeral=True)
         return
@@ -816,7 +800,6 @@ async def cmd_getkey(
     if not data.get("success"):
         await interaction.followup.send(f"Failed ({status}): `{data.get('reason', data)}`", ephemeral=True)
         return
-    # remember last claim for rate-limit optional
     DATA.setdefault("discord_claims", {})[str(interaction.user.id)] = {
         "username": uname,
         "key": data.get("key"),
@@ -827,7 +810,7 @@ async def cmd_getkey(
         f"**Your key** (bound to Roblox `{uname}`)\n"
         f"```{data.get('key')}```\n"
         f"Plan: `{data.get('plan')}` · expires unix `{data.get('expires_at')}`\n"
-        f"Activate with **Verify key** on the License panel, then use the loader in-game.\n"
+        f"Activate with **Verify key** on the License panel (can re-activate later).\n"
         f"_Do not share — it is tied to your Roblox name._",
         ephemeral=True,
     )
@@ -867,10 +850,45 @@ async def cmd_key(
         f"Plan: `{data.get('plan')}`\n"
         f"Expires (unix): `{data.get('expires_at')}`\n"
         f"Username: `{data.get('username') or 'pending'}`\n"
-        f"Pending: `{data.get('pending')}`\n\n"
-        f"_Users should be Discord-verified and use the same Roblox name as bound._"
+        f"Pending: `{data.get('pending')}`\n"
+        f"Activated: `0` (user must Verify)\n\n"
+        f"_Users should use **Verify key** (can activate more than once for new keys)._"
     )
     await interaction.followup.send(msg, ephemeral=True)
+
+
+@bot.tree.command(name="rewire", description="Rewire a paid key to another Roblox username")
+@app_commands.describe(key="Full key GH-XXXX-XXXX-XXXX", username="New Roblox username")
+async def cmd_rewire(interaction: discord.Interaction, key: str, username: str):
+    """Self-service rewire (API enforces paid plan + discord ownership)."""
+    if not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Use this in the server.", ephemeral=True)
+        return
+    uname = (username or "").strip()
+    if not re.match(r"^[A-Za-z0-9_]+$", uname):
+        await interaction.response.send_message("Invalid Roblox username.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    status, data = await api(
+        "POST",
+        "/api/discord/rewire",
+        {
+            "key": key.strip(),
+            "roblox_username": uname,
+            "username": uname,
+            "discord_id": str(interaction.user.id),
+        },
+    )
+    if not _api_ok(data):
+        err = data.get("error") or data.get("reason") or data.get("message") or data
+        await interaction.followup.send(f"Rewire failed: `{err}`", ephemeral=True)
+        return
+    await interaction.followup.send(
+        f"**Rewired** `{data.get('previous_username', '?')}` → `{uname}`\n"
+        f"Plan: `{data.get('plan', '?')}`\n"
+        f"Key: `{key.strip()}`",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="renew", description="Extend a key by N days")
@@ -980,9 +998,7 @@ async def cmd_whitelist(
     if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
         await interaction.response.send_message("Admin only.", ephemeral=True)
         return
-
     wl: list = list(DATA.get("key_whitelist") or [])
-
     if action.value == "list":
         if not wl:
             await interaction.response.send_message("Whitelist empty (only admins/sellers).", ephemeral=True)
@@ -990,11 +1006,9 @@ async def cmd_whitelist(
         lines = [f"<@{i}> (`{i}`)" for i in wl]
         await interaction.response.send_message("**Key whitelist:**\n" + "\n".join(lines), ephemeral=True)
         return
-
     if user is None:
         await interaction.response.send_message("Specify a user.", ephemeral=True)
         return
-
     uid = int(user.id)
     if action.value == "add":
         if uid not in wl:
@@ -1008,7 +1022,6 @@ async def cmd_whitelist(
             DATA["key_whitelist"] = wl
             save_data(DATA)
         await interaction.response.send_message(f"Removed {user.mention} from key whitelist.", ephemeral=True)
-
 
 
 @bot.tree.command(name="license_panel", description="Post license Verify/Rewire panel (admin)")
