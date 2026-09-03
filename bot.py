@@ -857,23 +857,84 @@ async def cmd_post_verify(interaction: discord.Interaction, channel: discord.Tex
     await interaction.response.send_message(f"Posted in {channel.mention}", ephemeral=True)
 
 
+
 def _managed_role_ids() -> set[int]:
     ids = {VERIFIED_ROLE_ID, FREE_REWIRE_ROLE_ID}
     for role_id, _label in EXECUTOR_GUILD_ROLES.values():
-        ids.add(role_id)
+        ids.add(int(role_id))
     ids.add(1545094564229161020)  # Solara
     return ids
 
 
+def _bot_can_manage_role(guild: discord.Guild, role: discord.Role) -> bool:
+    me = guild.me
+    if me is None:
+        return False
+    if not me.guild_permissions.manage_roles:
+        return False
+    # Bot must be strictly above the role
+    return me.top_role > role
+
+
+async def _strip_managed_and_unverify(member: discord.Member) -> tuple[str, str]:
+    """Returns (status, detail). status: ok | skip | error"""
+    guild = member.guild
+    if member.bot:
+        return "skip", "bot"
+    if is_owner(member):
+        return "skip", "owner"
+    if member.guild_permissions.administrator and not is_owner(member):
+        # still skip true admins, but owners already handled
+        if is_admin(member):
+            return "skip", "admin"
+
+    managed = _managed_role_ids()
+    unverified = guild.get_role(AUTO_ROLE_ID)
+    to_remove = [
+        r
+        for r in member.roles
+        if r.id in managed and r.is_assignable and r != guild.default_role
+    ]
+    details = []
+    try:
+        for r in to_remove:
+            if not _bot_can_manage_role(guild, r):
+                details.append(f"cant_remove:{r.name}")
+                continue
+            try:
+                await member.remove_roles(r, reason="reset_roles")
+            except Exception as e:
+                details.append(f"rm:{r.name}:{e}")
+        if unverified is None:
+            return "error", "unverified_role_missing"
+        if not _bot_can_manage_role(guild, unverified):
+            return "error", (
+                f"bot_role_too_low (bot={guild.me.top_role.name if guild.me else '?'} "
+                f"< unverified={unverified.name})"
+            )
+        if unverified not in member.roles:
+            await member.add_roles(unverified, reason="reset_roles → unverified")
+            details.append("added_unverified")
+        else:
+            details.append("already_unverified")
+        return "ok", ",".join(details) or "ok"
+    except Exception as e:
+        return "error", str(e)
+
+
 class ResetRolesConfirmView(discord.ui.View):
     def __init__(self, author_id: int):
-        super().__init__(timeout=60)
+        super().__init__(timeout=90)
         self.author_id = author_id
+        self.done = False
 
-    @discord.ui.button(label="Confirm reset ALL roles", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Confirm reset", style=discord.ButtonStyle.danger, custom_id="gh:reset_roles:yes")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.author_id:
             await interaction.response.send_message("Not your confirmation.", ephemeral=True)
+            return
+        if self.done:
+            await interaction.response.send_message("Already running/done.", ephemeral=True)
             return
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Guild only.", ephemeral=True)
@@ -881,63 +942,151 @@ class ResetRolesConfirmView(discord.ui.View):
         if not is_admin(interaction.user):
             await interaction.response.send_message("Admin only.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True)
-        guild = interaction.guild
-        unverified = guild.get_role(AUTO_ROLE_ID)
-        managed = _managed_role_ids()
-        skipped = 0
-        updated = 0
-        errors = 0
-        for member in list(guild.members):
-            if member.bot:
-                continue
-            if is_owner(member) or is_admin(member):
-                skipped += 1
-                continue
-            to_remove = [r for r in member.roles if r.id in managed and r != guild.default_role]
-            try:
-                if to_remove:
-                    await member.remove_roles(*to_remove, reason="reset_roles by admin")
-                if unverified and unverified not in member.roles:
-                    await member.add_roles(unverified, reason="reset_roles → unverified")
-                updated += 1
-                await asyncio.sleep(0.35)
-            except Exception as e:
-                errors += 1
-                print(f"[GH] reset_roles {member.id}: {e}")
+
+        self.done = True
         for child in self.children:
-            child.disabled = True  # type: ignore
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+        await interaction.response.edit_message(content="⏳ Resetting roles…", view=self)
+
+        guild = interaction.guild
+        me = guild.me
+        if me is None or not me.guild_permissions.manage_roles:
+            await interaction.followup.send(
+                "Bot needs **Manage Roles** and its role must be **above** Unverified + Member.",
+                ephemeral=True,
+            )
+            return
+
+        unverified = guild.get_role(AUTO_ROLE_ID)
+        if unverified is None:
+            await interaction.followup.send(
+                f"Unverified role id `{AUTO_ROLE_ID}` not found on this server.",
+                ephemeral=True,
+            )
+            return
+        if not _bot_can_manage_role(guild, unverified):
+            await interaction.followup.send(
+                f"Move bot role **above** `{unverified.name}` in Server Settings → Roles.",
+                ephemeral=True,
+            )
+            return
+
+        # Ensure member cache is as full as possible
         try:
-            await interaction.message.edit(view=self)  # type: ignore
+            if not guild.chunked:
+                await guild.chunk(cache=True)
         except Exception:
             pass
+
+        ok = skip = err = 0
+        err_samples: list[str] = []
+        for member in list(guild.members):
+            status, detail = await _strip_managed_and_unverify(member)
+            if status == "ok":
+                ok += 1
+            elif status == "skip":
+                skip += 1
+            else:
+                err += 1
+                if len(err_samples) < 5:
+                    err_samples.append(f"{member}: {detail}")
+            await asyncio.sleep(0.3)
+
+        extra = ("\n" + "\n".join(err_samples)) if err_samples else ""
         await interaction.followup.send(
-            f"**Reset done** · updated `{updated}` · skipped admins `{skipped}` · errors `{errors}`",
+            f"**Reset done**\n"
+            f"• updated: `{ok}`\n"
+            f"• skipped (bot/owner/admin): `{skip}`\n"
+            f"• errors: `{err}`{extra}",
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, custom_id="gh:reset_roles:no")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.author_id:
             await interaction.response.send_message("Not your confirmation.", ephemeral=True)
             return
         for child in self.children:
-            child.disabled = True  # type: ignore
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
         await interaction.response.edit_message(content="Cancelled.", view=self)
 
 
-@bot.tree.command(name="reset_roles", description="Reset managed roles → Unverified for all (admin, confirms)")
+@bot.tree.command(name="reset_roles", description="Reset managed roles → Unverified for all (admin)")
 async def cmd_reset_roles(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
         await interaction.response.send_message("Admin only.", ephemeral=True)
         return
+    guild = interaction.guild
+    unverified = guild.get_role(AUTO_ROLE_ID) if guild else None
+    warn = []
+    if unverified is None:
+        warn.append(f"⚠ role `{AUTO_ROLE_ID}` missing")
+    elif guild and guild.me and not _bot_can_manage_role(guild, unverified):
+        warn.append(f"⚠ bot role must be **above** `{unverified.name}`")
+    if guild and guild.me and not guild.me.guild_permissions.manage_roles:
+        warn.append("⚠ bot missing **Manage Roles**")
+    warn_txt = ("\n" + "\n".join(warn)) if warn else ""
     await interaction.response.send_message(
-        "⚠️ This removes **Member**, executor roles, free-rewire from **everyone** "
-        "(bots + **admins/owners skipped**), then grants **Unverified**.\n"
-        "Press **Confirm** within 60s.",
+        "⚠️ Removes **Member**, executor roles, free-rewire from non-admins, "
+        "then grants **Unverified**.\n"
+        "Owners/admins/bots are **skipped**.\n"
+        f"Unverified role: `{unverified.name if unverified else AUTO_ROLE_ID}`"
+        f"{warn_txt}\n"
+        "Press **Confirm reset** within 90s.",
         view=ResetRolesConfirmView(interaction.user.id),
         ephemeral=True,
     )
+
+
+@bot.tree.command(name="set_unverified", description="Force Unverified on one member (admin)")
+@app_commands.describe(member="Target member")
+async def cmd_set_unverified(interaction: discord.Interaction, member: discord.Member):
+    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    if is_owner(member) and not is_owner(interaction.user):
+        await interaction.followup.send("Cannot modify owner.", ephemeral=True)
+        return
+    # Allow admin to set unverified even on other admins only if caller is owner
+    if is_admin(member) and not is_owner(interaction.user):
+        await interaction.followup.send("Only owners can reset admins.", ephemeral=True)
+        return
+    # Temporarily treat target as non-admin path: strip managed + add unverified
+    guild = interaction.guild
+    if guild is None:
+        await interaction.followup.send("Guild only.", ephemeral=True)
+        return
+    unverified = guild.get_role(AUTO_ROLE_ID)
+    if unverified is None:
+        await interaction.followup.send(f"Unverified role `{AUTO_ROLE_ID}` missing.", ephemeral=True)
+        return
+    if not _bot_can_manage_role(guild, unverified):
+        await interaction.followup.send(
+            f"Move bot role **above** `{unverified.name}`.",
+            ephemeral=True,
+        )
+        return
+    managed = _managed_role_ids()
+    removed = []
+    for r in list(member.roles):
+        if r.id in managed and r.is_assignable:
+            try:
+                await member.remove_roles(r, reason="set_unverified")
+                removed.append(r.name)
+            except Exception as e:
+                removed.append(f"{r.name}?{e}")
+    try:
+        if unverified not in member.roles:
+            await member.add_roles(unverified, reason="set_unverified")
+        await interaction.followup.send(
+            f"{member.mention} → Unverified. Removed: {', '.join(removed) or '—'}",
+            ephemeral=True,
+        )
+    except Exception as e:
+        await interaction.followup.send(f"Failed to add Unverified: `{e}`", ephemeral=True)
 
 
 @bot.tree.command(name="reset_member_roles", description="Strip Member only (admin)")
@@ -948,7 +1097,13 @@ async def cmd_reset_member(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     role = interaction.guild.get_role(VERIFIED_ROLE_ID) if interaction.guild else None
     if not role:
-        await interaction.followup.send("Role missing.", ephemeral=True)
+        await interaction.followup.send("Member role missing.", ephemeral=True)
+        return
+    if interaction.guild and not _bot_can_manage_role(interaction.guild, role):
+        await interaction.followup.send(
+            f"Bot role must be above `{role.name}`.",
+            ephemeral=True,
+        )
         return
     n = 0
     for m in list(role.members):
@@ -957,7 +1112,7 @@ async def cmd_reset_member(interaction: discord.Interaction):
         try:
             await m.remove_roles(role, reason="reset_member_roles")
             n += 1
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(0.3)
         except Exception:
             pass
     await interaction.followup.send(f"Removed Member from {n} users (admins skipped).", ephemeral=True)
