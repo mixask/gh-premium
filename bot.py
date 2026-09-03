@@ -200,9 +200,40 @@ def oauth_link_for(user_id: int) -> str:
 
 async def fetch_oauth_status(user_id: int) -> dict:
     status, data = await api("GET", f"/api/discord/oauth/status?discord_id={user_id}")
-    if status != 200:
+    if status != 200 or not isinstance(data, dict):
         return {"authorized": False, "guild_ids": [], "error": data}
     return data
+
+
+def oauth_authorize_view(user_id: int) -> discord.ui.View:
+    view = discord.ui.View(timeout=300)
+    view.add_item(
+        discord.ui.Button(
+            label="Authorize / Verify with Discord",
+            style=discord.ButtonStyle.link,
+            url=oauth_link_for(user_id),
+        )
+    )
+    return view
+
+
+async def require_oauth(interaction: discord.Interaction) -> tuple[bool, dict]:
+    """Block actions until Discord OAuth (identify+guilds) is completed."""
+    st = await fetch_oauth_status(interaction.user.id)
+    if st.get("authorized"):
+        return True, st
+    text = (
+        "**You must authorize the bot before Verify key / Rewire.**\n"
+        "1. Click **Authorize / Verify with Discord**\n"
+        "2. Accept **identify** + **guilds**\n"
+        "3. Wait for the **Connected** page, then try again here."
+    )
+    view = oauth_authorize_view(interaction.user.id)
+    if interaction.response.is_done():
+        await interaction.followup.send(text, view=view, ephemeral=True)
+    else:
+        await interaction.response.send_message(text, view=view, ephemeral=True)
+    return False, st
 
 
 async def ensure_no_unverified_if_member(member: discord.Member) -> None:
@@ -290,9 +321,12 @@ class LicenseVerifyModal(discord.ui.Modal, title="Activate license key"):
         if not isinstance(interaction.user, discord.Member):
             await interaction.followup.send("Server only.", ephemeral=True)
             return
+        ok_oauth, _ = await require_oauth(interaction)
+        if not ok_oauth:
+            return
         if not is_verified(interaction.user):
             await interaction.followup.send(
-                "Server-verify first (Authorize bot → Verify), then activate key.",
+                "Finish **server Verify** first (executor roles), then activate key.",
                 ephemeral=True,
             )
             return
@@ -332,6 +366,9 @@ class LicenseRewireModal(discord.ui.Modal, title="Rewire key"):
         await interaction.response.defer(ephemeral=True)
         if not isinstance(interaction.user, discord.Member):
             await interaction.followup.send("Server only.", ephemeral=True)
+            return
+        ok_oauth, _ = await require_oauth(interaction)
+        if not ok_oauth:
             return
         uname = str(self.roblox.value).strip()
         free_role = interaction.guild.get_role(FREE_REWIRE_ROLE_ID) if interaction.guild else None
@@ -382,10 +419,27 @@ class LicensePanelView(discord.ui.View):
 
     @discord.ui.button(label="Verify key", style=discord.ButtonStyle.success, custom_id="cl:lic:v", row=0)
     async def v(self, interaction: discord.Interaction, button: discord.ui.Button):
+        st = await fetch_oauth_status(interaction.user.id)
+        if not st.get("authorized"):
+            await interaction.response.send_message(
+                "**Authorize the bot first.**\n"
+                "After the browser shows **Connected**, press **Verify key** again to enter your license.",
+                view=oauth_authorize_view(interaction.user.id),
+                ephemeral=True,
+            )
+            return
         await interaction.response.send_modal(LicenseVerifyModal())
 
     @discord.ui.button(label="Rewire", style=discord.ButtonStyle.primary, custom_id="cl:lic:r", row=0)
     async def r(self, interaction: discord.Interaction, button: discord.ui.Button):
+        st = await fetch_oauth_status(interaction.user.id)
+        if not st.get("authorized"):
+            await interaction.response.send_message(
+                "**Authorize the bot first** before rewire.",
+                view=oauth_authorize_view(interaction.user.id),
+                ephemeral=True,
+            )
+            return
         await interaction.response.send_modal(LicenseRewireModal())
 
 
@@ -434,7 +488,7 @@ class ServerVerifyView(discord.ui.View):
                 "1. Click **Authorize bot**\n"
                 "2. Accept identify + guilds\n"
                 "3. Press **Verify** again",
-                view=AuthorizeView(member.id),
+                view=oauth_authorize_view(member.id),
                 ephemeral=True,
             )
             return
@@ -773,7 +827,7 @@ async def cmd_oauth_status(interaction: discord.Interaction):
     if not st.get("authorized"):
         await interaction.followup.send(
             "Not authorized.",
-            view=AuthorizeView(interaction.user.id),
+            view=oauth_authorize_view(interaction.user.id),
             ephemeral=True,
         )
         return
