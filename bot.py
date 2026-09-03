@@ -45,7 +45,7 @@ ROLE_GH_UPDATES = int(os.getenv("ROLE_GH_UPDATES", "1443554745481560084"))
 UPDATES_CHANNEL_ID = int(os.getenv("UPDATES_CHANNEL_ID", "1428800296926314506"))
 GH_REPO = os.getenv("GH_REPO", "mixask/GH")
 WATCH_FILES = ("greedy.lua", "greedyloader.lua")
-DEFAULT_OWNERS = {1332400034892873761}
+DEFAULT_OWNERS = {1332400034892873761, 1426282728520679454, 1386544747279290459}
 DATA_PATH = Path(os.getenv("DATA_PATH", "data.json"))
 FORCE_TICKET_GUILD_ID = int(os.getenv("FORCE_TICKET_GUILD_ID", "1228053668797091904"))
 
@@ -311,6 +311,57 @@ async def open_ticket(
     return channel
 
 
+
+async def apply_oauth_server_roles(member: discord.Member) -> dict[str, Any]:
+    """OAuth status → executor roles + Member, or ticket signal."""
+    st = await fetch_oauth_status(member.id)
+    if not st.get("authorized"):
+        return {"ok": False, "need_oauth": True, "guild_ids": []}
+    guild_ids = {str(x) for x in (st.get("guild_ids") or [])}
+    force_ticket = str(FORCE_TICKET_GUILD_ID) in guild_ids
+    matches: list[tuple[int, str]] = []
+    for gid, (role_id, label) in EXECUTOR_GUILD_ROLES.items():
+        if gid in guild_ids:
+            matches.append((role_id, label))
+    granted: list[str] = []
+    for role_id, label in matches:
+        role = member.guild.get_role(role_id)
+        if not role:
+            continue
+        if role not in member.roles:
+            try:
+                await member.add_roles(role, reason=f"OAuth guild: {label}")
+                granted.append(label)
+            except Exception as e:
+                print(f"[GH] role {label}: {e}")
+        else:
+            granted.append(f"{label} (had)")
+
+    if matches and not force_ticket:
+        vrole = member.guild.get_role(VERIFIED_ROLE_ID)
+        if vrole and vrole not in member.roles:
+            try:
+                await member.add_roles(vrole, reason="OAuth auto-verify")
+            except Exception:
+                pass
+        await ensure_no_unverified_if_member(member)
+        await ensure_free_rewire_role(member)
+        return {
+            "ok": True,
+            "granted": granted,
+            "force_ticket": False,
+            "guild_ids": list(guild_ids),
+        }
+
+    return {
+        "ok": False,
+        "granted": granted,
+        "force_ticket": force_ticket,
+        "need_ticket": True,
+        "guild_ids": list(guild_ids),
+    }
+
+
 # ----- License UI -----
 class LicenseVerifyModal(discord.ui.Modal, title="Activate license key"):
     key = discord.ui.TextInput(label="License key", min_length=8, max_length=64, required=True)
@@ -417,13 +468,52 @@ class LicensePanelView(discord.ui.View):
         super().__init__(timeout=None)
         self.add_item(discord.ui.Button(label="Get free key", style=discord.ButtonStyle.link, url=KEY_LINK, row=1))
 
+    @discord.ui.button(label="Verify", style=discord.ButtonStyle.green, custom_id="cl:lic:sv", row=0, emoji="✅")
+    async def server_verify(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Use in server.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        member = interaction.user
+        await ensure_free_rewire_role(member)
+        result = await apply_oauth_server_roles(member)
+        if result.get("need_oauth"):
+            await interaction.followup.send(
+                "**Authorize the bot first** so it can see your servers.\n"
+                "1. Click **Authorize / Verify with Discord**\n"
+                "2. Accept **identify** + **guilds**\n"
+                "3. Wait for **Connected**, then press **Verify** again",
+                view=oauth_authorize_view(member.id),
+                ephemeral=True,
+            )
+            return
+        if result.get("ok"):
+            granted = result.get("granted") or []
+            await interaction.followup.send(
+                "**Verified via authorized servers:**\n"
+                + (", ".join(granted) if granted else "roles already present")
+                + "\nYou can use **Verify key**.",
+                ephemeral=True,
+            )
+            return
+        ch = await open_ticket(
+            interaction.guild,
+            member,
+            force_msg=bool(result.get("force_ticket")),
+            extra=("Matched: " + ", ".join(result.get("granted") or [])) if result.get("granted") else "",
+        )
+        if not ch:
+            await interaction.followup.send("Cannot create ticket (permissions).", ephemeral=True)
+            return
+        await interaction.followup.send(f"Ticket: {ch.mention}", ephemeral=True)
+
     @discord.ui.button(label="Verify key", style=discord.ButtonStyle.success, custom_id="cl:lic:v", row=0)
     async def v(self, interaction: discord.Interaction, button: discord.ui.Button):
         st = await fetch_oauth_status(interaction.user.id)
         if not st.get("authorized"):
             await interaction.response.send_message(
                 "**Authorize the bot first.**\n"
-                "After the browser shows **Connected**, press **Verify key** again to enter your license.",
+                "After the browser shows **Connected**, press **Verify** (roles) or **Verify key**.",
                 view=oauth_authorize_view(interaction.user.id),
                 ephemeral=True,
             )
@@ -445,11 +535,12 @@ class LicensePanelView(discord.ui.View):
 
 def license_embed() -> discord.Embed:
     return discord.Embed(
-        title="License panel",
+        title="License & verification",
         description=(
-            f"**Get free key** — {KEY_LINK}\n"
-            "**Verify key** — needs server Member (OAuth verify first)\n"
-            f"**Rewire** — paid or 1× free role `{FREE_REWIRE_ROLE_ID}`"
+            "**Verify** — authorize bot + get executor / Member roles\n"
+            "**Verify key** — activate license (after Verify)\n"
+            f"**Rewire** — paid or 1× free role\n"
+            f"**Get free key** — {KEY_LINK}"
         ),
         color=0xD4AF37,
     )
@@ -469,6 +560,7 @@ class AuthorizeView(discord.ui.View):
 
 
 class ServerVerifyView(discord.ui.View):
+    """Legacy standalone verify — same logic as License panel Verify."""
     def __init__(self) -> None:
         super().__init__(timeout=None)
 
@@ -480,66 +572,32 @@ class ServerVerifyView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         member = interaction.user
         await ensure_free_rewire_role(member)
-
-        st = await fetch_oauth_status(member.id)
-        if not st.get("authorized"):
+        result = await apply_oauth_server_roles(member)
+        if result.get("need_oauth"):
             await interaction.followup.send(
-                "**Authorize the bot first** so it can see your servers.\n"
-                "1. Click **Authorize bot**\n"
-                "2. Accept identify + guilds\n"
-                "3. Press **Verify** again",
+                "**Authorize the bot first.**",
                 view=oauth_authorize_view(member.id),
                 ephemeral=True,
             )
             return
-
-        guild_ids = {str(x) for x in (st.get("guild_ids") or [])}
-        force_ticket = str(FORCE_TICKET_GUILD_ID) in guild_ids
-        matches: list[tuple[int, str]] = []
-        for gid, (role_id, label) in EXECUTOR_GUILD_ROLES.items():
-            if gid in guild_ids:
-                matches.append((role_id, label))
-
-        granted = []
-        for role_id, label in matches:
-            role = interaction.guild.get_role(role_id)
-            if not role:
-                continue
-            if role not in member.roles:
-                try:
-                    await member.add_roles(role, reason=f"OAuth guild: {label}")
-                    granted.append(label)
-                except Exception as e:
-                    print(f"[GH] role {label}: {e}")
-            else:
-                granted.append(f"{label} (had)")
-
-        if matches and not force_ticket:
-            vrole = interaction.guild.get_role(VERIFIED_ROLE_ID)
-            if vrole and vrole not in member.roles:
-                try:
-                    await member.add_roles(vrole, reason="OAuth auto-verify")
-                except Exception:
-                    pass
-            await ensure_no_unverified_if_member(member)
+        if result.get("ok"):
+            granted = result.get("granted") or []
             await interaction.followup.send(
-                "**Verified via authorized servers:**\n"
-                + (", ".join(granted) if granted else "roles already present")
-                + "\nYou can use **Verify key**.",
+                "**Verified:** " + (", ".join(granted) if granted else "ok"),
                 ephemeral=True,
             )
             return
-
         ch = await open_ticket(
             interaction.guild,
             member,
-            force_msg=force_ticket,
-            extra=("Matched: " + ", ".join(granted)) if granted else "",
+            force_msg=bool(result.get("force_ticket")),
+            extra=("Matched: " + ", ".join(result.get("granted") or [])) if result.get("granted") else "",
         )
         if not ch:
-            await interaction.followup.send("Cannot create ticket (permissions).", ephemeral=True)
+            await interaction.followup.send("Cannot create ticket.", ephemeral=True)
             return
         await interaction.followup.send(f"Ticket: {ch.mention}", ephemeral=True)
+
 
 
 # ----- Events -----
@@ -795,11 +853,94 @@ async def cmd_post_verify(interaction: discord.Interaction, channel: discord.Tex
         ),
         color=0xC9A227,
     )
-    await channel.send(embed=emb, view=ServerVerifyView())
+    await channel.send(embed=license_embed(), view=LicensePanelView())
     await interaction.response.send_message(f"Posted in {channel.mention}", ephemeral=True)
 
 
-@bot.tree.command(name="reset_member_roles", description="Strip Member from everyone (admin)")
+def _managed_role_ids() -> set[int]:
+    ids = {VERIFIED_ROLE_ID, FREE_REWIRE_ROLE_ID}
+    for role_id, _label in EXECUTOR_GUILD_ROLES.values():
+        ids.add(role_id)
+    ids.add(1545094564229161020)  # Solara
+    return ids
+
+
+class ResetRolesConfirmView(discord.ui.View):
+    def __init__(self, author_id: int):
+        super().__init__(timeout=60)
+        self.author_id = author_id
+
+    @discord.ui.button(label="Confirm reset ALL roles", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Not your confirmation.", ephemeral=True)
+            return
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Guild only.", ephemeral=True)
+            return
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("Admin only.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        unverified = guild.get_role(AUTO_ROLE_ID)
+        managed = _managed_role_ids()
+        skipped = 0
+        updated = 0
+        errors = 0
+        for member in list(guild.members):
+            if member.bot:
+                continue
+            if is_owner(member) or is_admin(member):
+                skipped += 1
+                continue
+            to_remove = [r for r in member.roles if r.id in managed and r != guild.default_role]
+            try:
+                if to_remove:
+                    await member.remove_roles(*to_remove, reason="reset_roles by admin")
+                if unverified and unverified not in member.roles:
+                    await member.add_roles(unverified, reason="reset_roles → unverified")
+                updated += 1
+                await asyncio.sleep(0.35)
+            except Exception as e:
+                errors += 1
+                print(f"[GH] reset_roles {member.id}: {e}")
+        for child in self.children:
+            child.disabled = True  # type: ignore
+        try:
+            await interaction.message.edit(view=self)  # type: ignore
+        except Exception:
+            pass
+        await interaction.followup.send(
+            f"**Reset done** · updated `{updated}` · skipped admins `{skipped}` · errors `{errors}`",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Not your confirmation.", ephemeral=True)
+            return
+        for child in self.children:
+            child.disabled = True  # type: ignore
+        await interaction.response.edit_message(content="Cancelled.", view=self)
+
+
+@bot.tree.command(name="reset_roles", description="Reset managed roles → Unverified for all (admin, confirms)")
+async def cmd_reset_roles(interaction: discord.Interaction):
+    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        "⚠️ This removes **Member**, executor roles, free-rewire from **everyone** "
+        "(bots + **admins/owners skipped**), then grants **Unverified**.\n"
+        "Press **Confirm** within 60s.",
+        view=ResetRolesConfirmView(interaction.user.id),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="reset_member_roles", description="Strip Member only (admin)")
 async def cmd_reset_member(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
         await interaction.response.send_message("Admin only.", ephemeral=True)
@@ -811,13 +952,15 @@ async def cmd_reset_member(interaction: discord.Interaction):
         return
     n = 0
     for m in list(role.members):
+        if is_owner(m) or is_admin(m):
+            continue
         try:
             await m.remove_roles(role, reason="reset_member_roles")
             n += 1
             await asyncio.sleep(0.35)
         except Exception:
             pass
-    await interaction.followup.send(f"Removed from {n} users.", ephemeral=True)
+    await interaction.followup.send(f"Removed Member from {n} users (admins skipped).", ephemeral=True)
 
 
 @bot.tree.command(name="oauth_status", description="Check if you authorized the bot")
