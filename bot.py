@@ -261,11 +261,18 @@ async def open_ticket(
     guild: discord.Guild,
     member: discord.Member,
     *,
+    kind: str = "auto",
     force_msg: bool = False,
     extra: str = "",
 ) -> Optional[discord.TextChannel]:
+    """
+    kind:
+      - "auto"  — OAuth / server check failed → classic "couldnt verify automatically"
+      - "help"  — user pressed Help ticket → support template
+      - other   — legacy fallback
+    """
     for ch_id, meta in list((DATA.get("pending_tickets") or {}).items()):
-        if int(meta.get("user_id", 0)) == member.id:
+        if int(meta.get("user_id", 0)) == member.id and meta.get("kind", "auto") == kind:
             ch = guild.get_channel(int(ch_id))
             if ch:
                 return ch  # type: ignore
@@ -279,21 +286,38 @@ async def open_ticket(
         if role.permissions.administrator or role.id in ADMIN_ROLE_IDS:
             overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
     safe = re.sub(r"[^a-z0-9\-]", "", member.name.lower())[:20] or "user"
+    prefix = "help" if kind == "help" else "verify"
     try:
         channel = await guild.create_text_channel(
-            name=f"verify-{safe}",
+            name=f"{prefix}-{safe}",
             category=category if isinstance(category, discord.CategoryChannel) else None,
             overwrites=overwrites,
-            reason=f"Verify {member}",
+            reason=f"Ticket {kind} for {member}",
         )
     except discord.Forbidden:
         return None
     DATA.setdefault("pending_tickets", {})[str(channel.id)] = {
         "user_id": member.id,
         "created": int(time.time()),
+        "kind": kind,
     }
     save_data(DATA)
-    if force_msg:
+
+    # force_msg kept for backward compat → treat as auto
+    if force_msg and kind == "auto":
+        pass
+
+    if kind == "help":
+        text = (
+            f"{member.mention}\n"
+            "You created a ticket for help in the ticket system / key system.\n"
+            "**Please describe the error.**\n\n"
+            "**Common errors:**\n"
+            "1. **Application didn't respond** — the bot is receiving fixes, or it is temporarily down.\n"
+            "2. **We couldn't verify you automatically** — moderators will review the ticket; "
+            "this is intentional to prevent abuse."
+        )
+    elif kind == "auto" or force_msg:
         text = (
             f"{member.mention}\n"
             "We couldnt verify you automatically, sorry for that. "
@@ -312,7 +336,6 @@ async def open_ticket(
     return channel
 
 
-
 async def open_verify_ticket_only(member: discord.Member) -> dict[str, Any]:
     """After OAuth: open staff ticket only — never auto-grant roles from other servers."""
     st = await fetch_oauth_status(member.id)
@@ -322,7 +345,7 @@ async def open_verify_ticket_only(member: discord.Member) -> dict[str, Any]:
     ch = await open_ticket(
         member.guild,
         member,
-        force_msg=True,
+        kind="auto",
         extra=f"OAuth servers seen: {len(guild_ids)}",
     )
     if not ch:
@@ -476,28 +499,16 @@ class LicensePanelView(discord.ui.View):
 
     @discord.ui.button(label="Help ticket", style=discord.ButtonStyle.secondary, custom_id="cl:lic:ticket", row=0)
     async def ticket_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Manual staff ticket (no auto roles)."""
+        """User-opened support ticket (different message than auto-verify)."""
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Use in a server.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
-        st = await fetch_oauth_status(interaction.user.id)
-        if not st.get("authorized"):
-            await interaction.followup.send(
-                "Authorize first, then open a ticket.",
-                view=oauth_authorize_view(interaction.user.id),
-                ephemeral=True,
-            )
-            return
-        result = await open_verify_ticket_only(interaction.user)
-        ch = result.get("ticket")
+        ch = await open_ticket(interaction.guild, interaction.user, kind="help")
         if not ch:
             await interaction.followup.send("Cannot create ticket (permissions / category).", ephemeral=True)
             return
-        await interaction.followup.send(
-            f"Ticket opened: {ch.mention}\nStaff will assist — **no roles are auto-granted.**",
-            ephemeral=True,
-        )
+        await interaction.followup.send(f"Help ticket: {ch.mention}", ephemeral=True)
 
 
 
