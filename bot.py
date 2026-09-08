@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import re
 import time
 from pathlib import Path
@@ -39,6 +40,13 @@ VERIFY_CATEGORY_ID = int(os.getenv("VERIFY_CATEGORY_ID", "1453098727253479526"))
 VERIFIED_ROLE_ID = int(os.getenv("VERIFIED_ROLE_ID", "1445500571640402052"))
 FREE_REWIRE_ROLE_ID = int(os.getenv("FREE_REWIRE_ROLE_ID", "1545088955572158484"))
 QUARANTINE_ROLE_ID = int(os.getenv("QUARANTINE_ROLE_ID", "1545461244385828864"))
+MOD_ROLE_ID = int(os.getenv("MOD_ROLE_ID", "1445497065177088241"))
+WEBHOOKS_CHANNEL_ID = int(os.getenv("WEBHOOKS_CHANNEL_ID", "1546938830333153321"))
+JOIN_LOG_CHANNEL_ID = int(os.getenv("JOIN_LOG_CHANNEL_ID", "1438999670075686912"))
+DASHBOARD_CHANNEL_ID = int(os.getenv("DASHBOARD_CHANNEL_ID", "1546940370422865930"))
+VERIFY_CMD_CHANNEL_ID = int(os.getenv("VERIFY_CMD_CHANNEL_ID", "1544375383338655754"))
+BAN_PASSWORD = os.getenv("BAN_PASSWORD", "")
+GREETINGS = ["Hey there", "Hi", "Wassup", "Hello", "Yo", "Hey", "Welcome", "Sup"]
 RULES_CHANNEL_ID = int(os.getenv("RULES_CHANNEL_ID", "1424116614856441856"))
 REACT_CHANNEL_ID = int(os.getenv("REACT_CHANNEL_ID", "1448624840905855037"))
 ROLE_PARKOUR_ANN = int(os.getenv("ROLE_PARKOUR_ANN", "1445398639462584450"))
@@ -151,6 +159,12 @@ def is_admin(m: discord.Member) -> bool:
     if m.guild_permissions.administrator:
         return True
     return bool(ADMIN_ROLE_IDS and _roles(m) & ADMIN_ROLE_IDS)
+
+
+def is_mod(m: discord.Member) -> bool:
+    if is_owner(m) or is_admin(m):
+        return True
+    return MOD_ROLE_ID in _roles(m)
 
 
 def is_verified(m: discord.Member) -> bool:
@@ -462,7 +476,7 @@ class LicensePanelView(discord.ui.View):
         super().__init__(timeout=None)
         self.add_item(discord.ui.Button(label="Get free key", style=discord.ButtonStyle.link, url=KEY_LINK, row=1))
 
-    @discord.ui.button(label="Verify", style=discord.ButtonStyle.green, custom_id="cl:lic:verify", row=0, emoji="✅")
+    @discord.ui.button(label="Activate key", style=discord.ButtonStyle.green, custom_id="cl:lic:verify", row=0, emoji="✅")
     async def verify(self, interaction: discord.Interaction, button: discord.ui.Button):
         """
         One button:
@@ -478,7 +492,7 @@ class LicensePanelView(discord.ui.View):
                 "**Authorize the bot first.**\n"
                 "1. Click the button below\n"
                 "2. Accept **identify** + **guilds**\n"
-                "3. Return here and press **Verify** again to enter your key",
+                "3. Return here and press **Activate key** again to enter your key",
                 view=oauth_authorize_view(interaction.user.id),
                 ephemeral=True,
             )
@@ -565,6 +579,7 @@ class ServerVerifyView(discord.ui.View):
 async def on_ready():
     bot.add_view(ServerVerifyView())
     bot.add_view(LicensePanelView())
+    bot.add_view(SessionModView())
     try:
         only = os.getenv("GUILD_ID", "").strip()
         guilds = [discord.Object(id=int(only))] if only.isdigit() else list(bot.guilds)
@@ -598,6 +613,16 @@ async def on_member_join(member: discord.Member):
         except Exception:
             pass
     await ensure_free_rewire_role(member)
+    # greet in verify command channel
+    try:
+        ch = member.guild.get_channel(VERIFY_CMD_CHANNEL_ID)
+        if isinstance(ch, discord.TextChannel):
+            g = random.choice(GREETINGS)
+            await ch.send(
+                f"{g} {member.mention}, please use `/verify` in this channel to verify yourself."
+            )
+    except Exception:
+        pass
 
 
 @bot.event
@@ -680,7 +705,7 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
 
 
 async def setup_license_panel() -> None:
-    if not LICENSE_PANEL_CHANNEL_ID:
+    if not DASHBOARD_CHANNEL_ID or LICENSE_PANEL_CHANNEL_ID:
         return
     try:
         ch = bot.get_channel(LICENSE_PANEL_CHANNEL_ID) or await bot.fetch_channel(LICENSE_PANEL_CHANNEL_ID)
@@ -1098,12 +1123,20 @@ async def cmd_oauth_status(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="license_panel", description="Post license panel (admin)")
+@bot.tree.command(name="license_panel", description="Post license panel to dashboard (admin)")
 async def cmd_license_panel(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
         await interaction.response.send_message("Admin only.", ephemeral=True)
         return
-    await interaction.response.send_message(embed=license_embed(), view=LicensePanelView())
+    ch = None
+    if interaction.guild:
+        ch = interaction.guild.get_channel(DASHBOARD_CHANNEL_ID)
+    if not isinstance(ch, discord.TextChannel):
+        # fallback: post in current channel
+        await interaction.response.send_message(embed=license_embed(), view=LicensePanelView())
+        return
+    await ch.send(embed=license_embed(), view=LicensePanelView())
+    await interaction.response.send_message(f"Posted to {ch.mention}", ephemeral=True)
 
 
 @bot.tree.command(name="key", description="Generate key (seller/admin)")
@@ -1425,6 +1458,205 @@ async def cmd_whitelist(
         DATA["key_whitelist"] = [x for x in wl if x != user.id]
         save_data(DATA)
         await interaction.response.send_message(f"Removed {user.mention}", ephemeral=True)
+
+
+
+# ----- GH ban / unban / verify / webhook -----
+
+@bot.tree.command(name="verify", description="Get Discord OAuth verification link")
+async def cmd_verify(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "Authorize the bot (identify + guilds), then use **Activate key** on the license panel.",
+        view=oauth_authorize_view(interaction.user.id),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="ban", description="Ban key and/or Roblox username from GH")
+@app_commands.describe(key="License key", username="Roblox username", reason="Reason")
+async def cmd_ban(
+    interaction: discord.Interaction,
+    key: str = "",
+    username: str = "",
+    reason: str = "",
+):
+    if not isinstance(interaction.user, discord.Member) or not is_mod(interaction.user):
+        await interaction.response.send_message("Mod only.", ephemeral=True)
+        return
+    if not key.strip() and not username.strip():
+        await interaction.response.send_message("Need key and/or username.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    _, data = await api(
+        "POST",
+        "/admin/ban",
+        {
+            "key": key.strip(),
+            "username": username.strip(),
+            "reason": reason,
+            "by_discord": str(interaction.user.id),
+        },
+    )
+    await interaction.followup.send(
+        "Banned." if _api_ok(data) or data.get("success") else f"Fail: `{data}`",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="unban", description="Remove GH ban by key and/or username")
+@app_commands.describe(key="License key", username="Roblox username")
+async def cmd_unban(interaction: discord.Interaction, key: str = "", username: str = ""):
+    if not isinstance(interaction.user, discord.Member) or not is_mod(interaction.user):
+        await interaction.response.send_message("Mod only.", ephemeral=True)
+        return
+    if not key.strip() and not username.strip():
+        await interaction.response.send_message("Need key and/or username.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    _, data = await api(
+        "POST",
+        "/admin/unban",
+        {
+            "key": key.strip(),
+            "username": username.strip(),
+            "by_discord": str(interaction.user.id),
+        },
+    )
+    await interaction.followup.send(
+        "Unbanned." if _api_ok(data) or data.get("success") else f"Fail: `{data}`",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="create_webhook", description="Create personal webhook in GH webhooks channel (mod)")
+@app_commands.describe(roblox_name="Roblox username for webhook name")
+async def cmd_create_webhook(interaction: discord.Interaction, roblox_name: str):
+    if not isinstance(interaction.user, discord.Member) or not is_mod(interaction.user):
+        await interaction.response.send_message("Mod only (users: hub Create Webhook).", ephemeral=True)
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("Guild only.", ephemeral=True)
+        return
+    ch = interaction.guild.get_channel(WEBHOOKS_CHANNEL_ID)
+    if not isinstance(ch, discord.TextChannel):
+        await interaction.response.send_message("Webhooks channel missing.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    name = re.sub(r"[^\w\- ]", "", roblox_name)[:80] or "gh-user"
+    try:
+        wh = await ch.create_webhook(name=name, reason=f"GH webhook {roblox_name}")
+    except Exception as e:
+        await interaction.followup.send(f"Fail: `{e}`", ephemeral=True)
+        return
+    await api(
+        "POST",
+        "/admin/webhook-register",
+        {
+            "webhook_id": str(wh.id),
+            "url": wh.url,
+            "roblox_name": roblox_name,
+            "discord_id": str(interaction.user.id),
+        },
+    )
+    await interaction.followup.send(f"Created:\n`{wh.url}`", ephemeral=True)
+
+
+@bot.tree.command(name="fix_command_scope", description="How to allow slash commands outside threads")
+async def cmd_fix_command_scope(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "Server Settings → Integrations → this bot → enable slash commands in **text channels** "
+        "(not threads-only). Discord UI controls this.",
+        ephemeral=True,
+    )
+
+
+class SessionKickModal(discord.ui.Modal, title="Kick player (client)"):
+    reason = discord.ui.TextInput(label="Kick message", max_length=200)
+
+    def __init__(self, roblox_id: str, roblox_name: str):
+        super().__init__()
+        self.roblox_id = roblox_id
+        self.roblox_name = roblox_name
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member) or not is_mod(interaction.user):
+            await interaction.response.send_message("Mod only.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        _, data = await api(
+            "POST",
+            "/admin/kick",
+            {"user_id": self.roblox_id, "reason": str(self.reason)},
+        )
+        await interaction.followup.send(
+            f"Kick queued for **{self.roblox_name}**."
+            if data.get("success") or _api_ok(data)
+            else f"Fail: `{data}`",
+            ephemeral=True,
+        )
+
+
+class SessionBanModal(discord.ui.Modal, title="Ban key + username"):
+    password = discord.ui.TextInput(label="Confirm password", max_length=64)
+    reason = discord.ui.TextInput(label="Reason", required=False, max_length=200)
+
+    def __init__(self, key: str, roblox_name: str):
+        super().__init__()
+        self.key = key
+        self.roblox_name = roblox_name
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member) or not is_mod(interaction.user):
+            await interaction.response.send_message("Mod only.", ephemeral=True)
+            return
+        if BAN_PASSWORD and str(self.password) != BAN_PASSWORD:
+            await interaction.response.send_message("Wrong password.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        _, data = await api(
+            "POST",
+            "/admin/ban",
+            {
+                "key": self.key,
+                "username": self.roblox_name,
+                "reason": str(self.reason or ""),
+                "by_discord": str(interaction.user.id),
+            },
+        )
+        await interaction.followup.send(
+            "Banned." if data.get("success") or _api_ok(data) else f"Fail: `{data}`",
+            ephemeral=True,
+        )
+
+
+class SessionModView(discord.ui.View):
+    """Persistent-ish session controls (custom_id includes payload via short hash optional)."""
+
+    def __init__(self, roblox_name: str = "", roblox_id: str = "", key: str = ""):
+        super().__init__(timeout=None)
+        self.roblox_name = roblox_name
+        self.roblox_id = str(roblox_id)
+        self.key = key or ""
+
+    @discord.ui.button(label="Kick", style=discord.ButtonStyle.secondary, custom_id="gh:sess:kick")
+    async def kick_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not is_mod(interaction.user):
+            await interaction.response.send_message("Mod only.", ephemeral=True)
+            return
+        # Prefer modal; roblox_id may be empty if view restored without state
+        await interaction.response.send_modal(
+            SessionKickModal(self.roblox_id or "0", self.roblox_name or "player")
+        )
+
+    @discord.ui.button(label="Ban", style=discord.ButtonStyle.danger, custom_id="gh:sess:ban")
+    async def ban_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not is_mod(interaction.user):
+            await interaction.response.send_message("Mod only.", ephemeral=True)
+            return
+        await interaction.response.send_modal(
+            SessionBanModal(self.key, self.roblox_name or "")
+        )
+
 
 
 def main():
