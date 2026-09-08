@@ -30,7 +30,7 @@ ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 KEY_LINK = os.getenv("KEY_LINK", "https://work.ink/28wp/Greedy-hudzell")
-DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "").strip()
+DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "1426282728520679454").strip()
 OAUTH_START_URL = os.getenv("OAUTH_START_URL", f"{API_BASE}/api/discord/oauth/start").rstrip("/")
 
 STATUS_CHANNEL_ID = int(os.getenv("STATUS_CHANNEL_ID", "1472311662307574025"))
@@ -1600,10 +1600,11 @@ class SessionBanModal(discord.ui.Modal, title="Ban key + username"):
     password = discord.ui.TextInput(label="Confirm password", max_length=64)
     reason = discord.ui.TextInput(label="Reason", required=False, max_length=200)
 
-    def __init__(self, key: str, roblox_name: str):
+    def __init__(self, key: str, roblox_name: str, roblox_id: str = ""):
         super().__init__()
         self.key = key
         self.roblox_name = roblox_name
+        self.roblox_id = str(roblox_id or "")
 
     async def on_submit(self, interaction: discord.Interaction):
         if not isinstance(interaction.user, discord.Member) or not is_mod(interaction.user):
@@ -1613,18 +1614,17 @@ class SessionBanModal(discord.ui.Modal, title="Ban key + username"):
             await interaction.response.send_message("Wrong password.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
-        _, data = await api(
-            "POST",
-            "/admin/ban",
-            {
-                "key": self.key,
-                "username": self.roblox_name,
-                "reason": str(self.reason or ""),
-                "by_discord": str(interaction.user.id),
-            },
-        )
+        payload = {
+            "key": self.key,
+            "username": self.roblox_name,
+            "reason": str(self.reason or "Banned from Greedy Hudzell"),
+            "by_discord": str(interaction.user.id),
+        }
+        if self.roblox_id and self.roblox_id != "0":
+            payload["user_id"] = self.roblox_id
+        _, data = await api("POST", "/admin/ban", payload)
         await interaction.followup.send(
-            "Banned." if data.get("success") or _api_ok(data) else f"Fail: `{data}`",
+            "Banned (+ kick queued)." if data.get("success") or _api_ok(data) else f"Fail: `{data}`",
             ephemeral=True,
         )
 
@@ -1654,7 +1654,7 @@ class SessionModView(discord.ui.View):
             await interaction.response.send_message("Mod only.", ephemeral=True)
             return
         await interaction.response.send_modal(
-            SessionBanModal(self.key, self.roblox_name or "")
+            SessionBanModal(self.key, self.roblox_name or "", self.roblox_id or "")
         )
 
 
