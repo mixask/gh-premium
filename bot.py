@@ -247,6 +247,46 @@ async def fetch_oauth_status(user_id: int) -> dict:
     return data
 
 
+async def grant_oauth_roles(member: discord.Member, guild_ids: list) -> list[str]:
+    """
+    Called whenever we've confirmed a member is OAuth-authorized.
+    Grants:
+      - the Verified/Member role (VERIFIED_ROLE_ID), immediately
+      - any executor-community role from EXECUTOR_GUILD_ROLES whose guild id
+        shows up in the OAuth-reported guild_ids
+    Returns the list of role names that were newly added (for feedback messages).
+    """
+    granted: list[str] = []
+    guild = member.guild
+    if guild is None:
+        return granted
+
+    vrole = guild.get_role(VERIFIED_ROLE_ID)
+    if vrole and vrole not in member.roles:
+        try:
+            await member.add_roles(vrole, reason="OAuth authorized")
+            granted.append(vrole.name)
+        except Exception as e:
+            print(f"[GH] grant_oauth_roles: failed to add Member role for {member}: {e}")
+
+    gid_set = set(map(str, guild_ids or []))
+    for gid, (role_id, label) in EXECUTOR_GUILD_ROLES.items():
+        if gid not in gid_set:
+            continue
+        role = guild.get_role(role_id)
+        if role and role not in member.roles:
+            try:
+                await member.add_roles(role, reason=f"OAuth matched community: {label}")
+                granted.append(role.name)
+            except Exception as e:
+                print(f"[GH] grant_oauth_roles: failed to add {label} role for {member}: {e}")
+
+    if granted:
+        await ensure_no_unverified_if_member(member)
+        await ensure_free_rewire_role(member)
+    return granted
+
+
 def oauth_authorize_view(user_id: int) -> discord.ui.View:
     view = discord.ui.View(timeout=300)
     view.add_item(
@@ -263,6 +303,8 @@ async def require_oauth(interaction: discord.Interaction) -> tuple[bool, dict]:
     """Block actions until Discord OAuth (identify+guilds) is completed."""
     st = await fetch_oauth_status(interaction.user.id)
     if st.get("authorized"):
+        if isinstance(interaction.user, discord.Member):
+            await grant_oauth_roles(interaction.user, st.get("guild_ids") or [])
         return True, st
     text = (
         "**You must authorize the bot before Verify key / Rewire.**\n"
@@ -524,6 +566,7 @@ class LicensePanelView(discord.ui.View):
                 ephemeral=True,
             )
             return
+        await grant_oauth_roles(interaction.user, st.get("guild_ids") or [])
         await interaction.response.send_modal(LicenseVerifyModal())
 
     @discord.ui.button(label="Rewire", style=discord.ButtonStyle.primary, custom_id="cl:lic:r", row=0)
@@ -536,6 +579,8 @@ class LicensePanelView(discord.ui.View):
                 ephemeral=True,
             )
             return
+        if isinstance(interaction.user, discord.Member):
+            await grant_oauth_roles(interaction.user, st.get("guild_ids") or [])
         await interaction.response.send_modal(LicenseRewireModal())
 
     @discord.ui.button(label="Help ticket", style=discord.ButtonStyle.secondary, custom_id="cl:lic:ticket", row=0)
@@ -776,6 +821,7 @@ class ServerVerifyView(discord.ui.View):
                 ephemeral=True,
             )
             return
+        await grant_oauth_roles(interaction.user, st.get("guild_ids") or [])
         await interaction.response.send_modal(LicenseVerifyModal())
 
 
@@ -1496,9 +1542,14 @@ async def cmd_oauth_status(interaction: discord.Interaction):
         return
     gids = st.get("guild_ids") or []
     matched = [label for gid, (_, label) in EXECUTOR_GUILD_ROLES.items() if gid in set(map(str, gids))]
+    granted: list[str] = []
+    if isinstance(interaction.user, discord.Member):
+        granted = await grant_oauth_roles(interaction.user, gids)
+    extra = f"\nGranted now: {', '.join(granted)}" if granted else ""
     await interaction.followup.send(
         f"Authorized · **{len(gids)}** servers\n"
-        f"Matched: {', '.join(matched) if matched else '(none)'}",
+        f"Matched: {', '.join(matched) if matched else '(none)'}"
+        f"{extra}",
         ephemeral=True,
     )
 
@@ -1904,8 +1955,30 @@ async def cmd_whitelist(
 
 @bot.tree.command(name="verify", description="Get Discord OAuth verification link")
 async def cmd_verify(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        "Authorize the bot (identify + guilds), then use **Activate key** on the license panel.",
+    if not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "Authorize the bot (identify + guilds), then use **Activate key** on the license panel.",
+            view=oauth_authorize_view(interaction.user.id),
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    st = await fetch_oauth_status(interaction.user.id)
+    if st.get("authorized"):
+        granted = await grant_oauth_roles(interaction.user, st.get("guild_ids") or [])
+        if granted:
+            await interaction.followup.send(
+                f"✅ Authorized. Granted: {', '.join(granted)}",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                "✅ Already authorized and up to date — no new roles to grant.",
+                ephemeral=True,
+            )
+        return
+    await interaction.followup.send(
+        "Authorize the bot (identify + guilds), then run `/verify` again to get your roles.",
         view=oauth_authorize_view(interaction.user.id),
         ephemeral=True,
     )
