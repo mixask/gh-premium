@@ -65,6 +65,26 @@ DEFAULT_OWNERS = {1332400034892873761, 1426282728520679454, 1386544747279290459}
 DATA_PATH = Path(os.getenv("DATA_PATH", "data.json"))
 FORCE_TICKET_GUILD_ID = int(os.getenv("FORCE_TICKET_GUILD_ID", "1228053668797091904"))
 
+# --- Defensive fallback -----------------------------------------------------
+# Guards against a NameError like:
+#   NameError: name 'CAT_BUG_REPORT' is not defined
+# which happens if one of the CAT_* (or any other) constants above ends up
+# missing/reordered in a deployed copy of this file (e.g. from a partial
+# edit or bad merge). This makes sure every constant referenced by
+# TICKET_TYPES below always exists, falling back to 0 (which just means
+# "no category" — the ticket will still be created, just without a
+# category assigned) instead of crashing the whole bot on startup.
+for _name, _default in {
+    "CAT_BUG_REPORT": 0,
+    "CAT_SUGGESTION": 0,
+    "CAT_SUPPORT": 0,
+    "CAT_REQUEST_KEY": 0,
+}.items():
+    if _name not in globals():
+        print(f"[GH] WARNING: {_name} was not defined — falling back to {_default}")
+        globals()[_name] = _default
+# -----------------------------------------------------------------------------
+
 EXECUTOR_GUILD_ROLES: dict[str, tuple[int, str]] = {
     "1289988589052104846": (1545091882101506048, "Potassium"),
     "1483453559692595252": (1545092000116904017, "Madium"),
