@@ -47,6 +47,11 @@ DASHBOARD_CHANNEL_ID = int(os.getenv("DASHBOARD_CHANNEL_ID", "154694037042286593
 VERIFY_CMD_CHANNEL_ID = int(os.getenv("VERIFY_CMD_CHANNEL_ID", "1544375383338655754"))
 ENG_GENERAL_ID = int(os.getenv("ENG_GENERAL_ID", "1441745275268894801"))
 RU_GENERAL_ID = int(os.getenv("RU_GENERAL_ID", "1422222410454798539"))
+TICKET_PANEL_CHANNEL_ID = int(os.getenv("TICKET_PANEL_CHANNEL_ID", "1430602816946176080"))
+CAT_BUG_REPORT = int(os.getenv("CAT_BUG_REPORT", "1448630113573801994"))
+CAT_SUGGESTION = int(os.getenv("CAT_SUGGESTION", "1449352046200361063"))
+CAT_SUPPORT = int(os.getenv("CAT_SUPPORT", "1426220048183328881"))
+CAT_REQUEST_KEY = int(os.getenv("CAT_REQUEST_KEY", "1426220048183328881"))
 BAN_PASSWORD = os.getenv("BAN_PASSWORD", "")
 GREETINGS = ["Hey there", "Hi", "Wassup", "Hello", "Yo", "Hey", "Welcome", "Sup"]
 RULES_CHANNEL_ID = int(os.getenv("RULES_CHANNEL_ID", "1424116614856441856"))
@@ -1054,7 +1059,16 @@ async def setup_license_panel() -> None:
     if not target:
         return
     try:
-        ch = bot.get_channel(target) or await bot.fetch_channel(target)
+        ch = bot.get_channel(target)
+        if ch is None:
+            try:
+                ch = await bot.fetch_channel(target)
+            except discord.NotFound:
+                print(f"[GH] license panel: channel {target} missing — use /license_panel")
+                return
+            except Exception as e:
+                print("[GH] license panel fetch", e)
+                return
         if not isinstance(ch, discord.TextChannel):
             return
         async for msg in ch.history(limit=15):
