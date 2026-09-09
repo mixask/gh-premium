@@ -476,7 +476,7 @@ class LicensePanelView(discord.ui.View):
         super().__init__(timeout=None)
         self.add_item(discord.ui.Button(label="Get free key", style=discord.ButtonStyle.link, url=KEY_LINK, row=1))
 
-    @discord.ui.button(label="Activate key", style=discord.ButtonStyle.green, custom_id="cl:lic:verify", row=0, emoji="✅")
+    @discord.ui.button(label="Activate key", style=discord.ButtonStyle.primary, custom_id="cl:lic:verify", row=0, emoji="🔑")
     async def verify(self, interaction: discord.Interaction, button: discord.ui.Button):
         """
         One button:
@@ -619,7 +619,7 @@ async def on_member_join(member: discord.Member):
         if isinstance(ch, discord.TextChannel):
             g = random.choice(GREETINGS)
             await ch.send(
-                f"{g} {member.mention}, please use `/verify` in this channel to verify yourself."
+                f"{g} {member.mention}, type `?verify` or `verify` in this channel to get the authorize link."
             )
     except Exception:
         pass
@@ -632,7 +632,40 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot or not message.guild or not isinstance(message.author, discord.Member):
+    if message.author.bot or not message.guild:
+        return
+
+    # ----- verify-here channel: ?verify / /verify / verify (no slash auth needed) -----
+    if message.channel.id == VERIFY_CMD_CHANNEL_ID and isinstance(message.author, discord.Member):
+        raw = (message.content or "").strip()
+        low = raw.lower()
+        # strip common prefixes
+        for prefix in ("?", "/", "!", "."):
+            if low.startswith(prefix):
+                low = low[len(prefix) :].strip()
+                break
+        if low in ("verify", "verify me", "verification", "auth", "authorize") or low.startswith(
+            "verify "
+        ):
+            try:
+                await message.reply(
+                    f"{message.author.mention} **Verify / authorize the bot**\n"
+                    "1. Open the link (identify + guilds)\n"
+                    "2. Then use **🔑 Activate key** on the license panel",
+                    view=oauth_authorize_view(message.author.id),
+                    mention_author=True,
+                )
+            except Exception:
+                try:
+                    await message.channel.send(
+                        f"{message.author.mention} authorize here:",
+                        view=oauth_authorize_view(message.author.id),
+                    )
+                except Exception as e:
+                    print("[GH] verify-here reply", e)
+            return
+
+    if not isinstance(message.author, discord.Member):
         return
     meta = (DATA.get("pending_tickets") or {}).get(str(message.channel.id))
     if not meta or int(meta.get("user_id", 0)) != message.author.id:
@@ -1472,33 +1505,77 @@ async def cmd_verify(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="ban", description="Ban key and/or Roblox username from GH")
-@app_commands.describe(key="License key", username="Roblox username", reason="Reason")
+@bot.tree.command(name="ban", description="Ban key and/or Roblox username/userId from GH")
+@app_commands.describe(
+    key="License key",
+    username="Roblox username",
+    user_id="Roblox user id (queues kick)",
+    reason="Reason",
+)
 async def cmd_ban(
     interaction: discord.Interaction,
     key: str = "",
     username: str = "",
+    user_id: str = "",
     reason: str = "",
 ):
     if not isinstance(interaction.user, discord.Member) or not is_mod(interaction.user):
         await interaction.response.send_message("Mod only.", ephemeral=True)
         return
-    if not key.strip() and not username.strip():
-        await interaction.response.send_message("Need key and/or username.", ephemeral=True)
+    uid = "".join(c for c in (user_id or "") if c.isdigit())
+    if not key.strip() and not username.strip() and not uid:
+        await interaction.response.send_message("Need key, username, and/or user_id.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    payload = {
+        "key": key.strip(),
+        "username": username.strip(),
+        "reason": reason or "Banned from Greedy Hudzell",
+        "by_discord": str(interaction.user.id),
+    }
+    if uid:
+        payload["user_id"] = uid
+    _, data = await api("POST", "/admin/ban", payload)
+    ok = _api_ok(data) or data.get("success")
+    extra = " (+ kick queued)" if uid and ok else ""
+    await interaction.followup.send(
+        ("Banned." + extra) if ok else f"Fail: `{data}`",
+        ephemeral=True,
+    )
+
+
+
+@bot.tree.command(name="kick", description="Queue client kick for Roblox userId (mod)")
+@app_commands.describe(user_id="Roblox user id", reason="Kick message shown to player", username="Optional Roblox name (log only)")
+async def cmd_kick(
+    interaction: discord.Interaction,
+    user_id: str,
+    reason: str = "Kicked by moderator",
+    username: str = "",
+):
+    if not isinstance(interaction.user, discord.Member) or not is_mod(interaction.user):
+        await interaction.response.send_message("Mod only.", ephemeral=True)
+        return
+    uid = "".join(c for c in user_id if c.isdigit())
+    if not uid:
+        await interaction.response.send_message("Need numeric Roblox user_id.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     _, data = await api(
         "POST",
-        "/admin/ban",
+        "/admin/kick",
         {
-            "key": key.strip(),
+            "user_id": uid,
+            "reason": reason or "Kicked by moderator",
             "username": username.strip(),
-            "reason": reason,
             "by_discord": str(interaction.user.id),
         },
     )
+    ok = _api_ok(data) or data.get("success")
     await interaction.followup.send(
-        "Banned." if _api_ok(data) or data.get("success") else f"Fail: `{data}`",
+        f"Kick queued for `{uid}`" + (f" ({username})" if username else "") + "."
+        if ok
+        else f"Fail: `{data}`",
         ephemeral=True,
     )
 
