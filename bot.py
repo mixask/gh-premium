@@ -66,14 +66,6 @@ DATA_PATH = Path(os.getenv("DATA_PATH", "data.json"))
 FORCE_TICKET_GUILD_ID = int(os.getenv("FORCE_TICKET_GUILD_ID", "1228053668797091904"))
 
 # --- Defensive fallback -----------------------------------------------------
-# Guards against a NameError like:
-#   NameError: name 'CAT_BUG_REPORT' is not defined
-# which happens if one of the CAT_* (or any other) constants above ends up
-# missing/reordered in a deployed copy of this file (e.g. from a partial
-# edit or bad merge). This makes sure every constant referenced by
-# TICKET_TYPES below always exists, falling back to 0 (which just means
-# "no category" — the ticket will still be created, just without a
-# category assigned) instead of crashing the whole bot on startup.
 for _name, _default in {
     "CAT_BUG_REPORT": 0,
     "CAT_SUGGESTION": 0,
@@ -262,12 +254,34 @@ async def grant_oauth_roles(member: discord.Member, guild_ids: list) -> list[str
         return granted
 
     vrole = guild.get_role(VERIFIED_ROLE_ID)
-    if vrole and vrole not in member.roles:
-        try:
-            await member.add_roles(vrole, reason="OAuth authorized")
+    if vrole:
+        if vrole not in member.roles:
+            try:
+                await member.add_roles(vrole, reason="OAuth authorized")
+                granted.append(vrole.name)
+            except discord.Forbidden:
+                # Bot doesn't have permission or role hierarchy issue
+                log_ch = guild.get_channel(WEBHOOKS_CHANNEL_ID)
+                if log_ch and isinstance(log_ch, discord.TextChannel):
+                    await log_ch.send(
+                        f"⚠️ Failed to give {vrole.name} to {member.mention} - "
+                        "bot role is too low or missing Manage Roles permission"
+                    )
+                print(f"[GH] Forbidden: Cannot add {vrole.name} to {member}")
+            except Exception as e:
+                print(f"[GH] grant_oauth_roles: failed to add Member role for {member}: {e}")
+        else:
+            # Role already present - still count as granted for feedback
             granted.append(vrole.name)
-        except Exception as e:
-            print(f"[GH] grant_oauth_roles: failed to add Member role for {member}: {e}")
+    else:
+        # Role not found on server - critical error
+        log_ch = guild.get_channel(WEBHOOKS_CHANNEL_ID)
+        if log_ch and isinstance(log_ch, discord.TextChannel):
+            await log_ch.send(
+                f"⚠️ **CRITICAL**: Role with ID {VERIFIED_ROLE_ID} not found on this server! "
+                "Member role cannot be assigned."
+            )
+        print(f"[GH] ERROR: VERIFIED_ROLE_ID {VERIFIED_ROLE_ID} not found on guild {guild.id}")
 
     gid_set = set(map(str, guild_ids or []))
     for gid, (role_id, label) in EXECUTOR_GUILD_ROLES.items():
@@ -436,7 +450,6 @@ async def open_verify_ticket_only(member: discord.Member) -> dict[str, Any]:
     return {"ok": True, "ticket": ch, "guild_ids": guild_ids}
 
 
-
 # ----- License UI -----
 class LicenseVerifyModal(discord.ui.Modal, title="Activate license key"):
     key = discord.ui.TextInput(label="License key", min_length=8, max_length=64, required=True)
@@ -595,8 +608,6 @@ class LicensePanelView(discord.ui.View):
             await interaction.followup.send("Cannot create ticket (permissions / category).", ephemeral=True)
             return
         await interaction.followup.send(f"Help ticket: {ch.mention}", ephemeral=True)
-
-
 
 
 # ----- Support ticket panel (dropdown) -----
@@ -776,7 +787,6 @@ async def setup_ticket_panel() -> None:
         print("[GH] ticket panel", e)
 
 
-
 def license_embed() -> discord.Embed:
     return discord.Embed(
         title="Dashboard ⚙️",
@@ -825,7 +835,6 @@ class ServerVerifyView(discord.ui.View):
         await interaction.response.send_modal(LicenseVerifyModal())
 
 
-
 # ----- Events -----
 @bot.event
 async def on_ready():
@@ -860,14 +869,34 @@ async def on_ready():
 
 @bot.event
 async def on_member_join(member: discord.Member):
+    """Called when a new member joins the server."""
+    # Give Unverified role
     role = member.guild.get_role(AUTO_ROLE_ID)
     if role and role not in member.roles:
         try:
             await member.add_roles(role, reason="join")
         except Exception:
             pass
+    
+    # Give Free Rewire role
     await ensure_free_rewire_role(member)
-    # greet in verify command channel
+    
+    # Check if user is already OAuth-authorized and grant Member role if so
+    try:
+        st = await fetch_oauth_status(member.id)
+        if st.get("authorized"):
+            granted = await grant_oauth_roles(member, st.get("guild_ids") or [])
+            if granted:
+                # Log successful auto-verification
+                log_ch = member.guild.get_channel(JOIN_LOG_CHANNEL_ID)
+                if log_ch and isinstance(log_ch, discord.TextChannel):
+                    await log_ch.send(
+                        f"✅ {member.mention} auto-verified via OAuth. Granted: {', '.join(granted)}"
+                    )
+    except Exception as e:
+        print(f"[GH] on_member_join OAuth check failed for {member}: {e}")
+    
+    # Greet in verify command channel
     try:
         ch = member.guild.get_channel(VERIFY_CMD_CHANNEL_ID)
         if isinstance(ch, discord.TextChannel):
@@ -882,7 +911,6 @@ async def on_member_join(member: discord.Member):
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
     await ensure_no_unverified_if_member(after)
-
 
 
 def _cyrillic_ratio(text: str) -> float:
@@ -915,7 +943,6 @@ def looks_english_only(text: str) -> bool:
     if _cyrillic_ratio(text) >= 0.15:
         return False
     return _latin_ratio(text) >= 0.55
-
 
 
 # ----- Language filter (simple heuristics) -----
@@ -1021,6 +1048,33 @@ async def on_message(message: discord.Message):
         if low in ("verify", "verify me", "verification", "auth", "authorize") or low.startswith(
             "verify "
         ):
+            # Check if user is already authorized
+            st = await fetch_oauth_status(message.author.id)
+            if st.get("authorized"):
+                granted = await grant_oauth_roles(message.author, st.get("guild_ids") or [])
+                if granted:
+                    try:
+                        await message.reply(
+                            f"✅ {message.author.mention} You're already authorized! Granted: {', '.join(granted)}",
+                            mention_author=True,
+                        )
+                    except Exception:
+                        await message.channel.send(
+                            f"✅ {message.author.mention} Already authorized! Granted: {', '.join(granted)}"
+                        )
+                else:
+                    try:
+                        await message.reply(
+                            f"✅ {message.author.mention} Already authorized! No new roles to grant.",
+                            mention_author=True,
+                        )
+                    except Exception:
+                        await message.channel.send(
+                            f"✅ {message.author.mention} Already authorized!"
+                        )
+                return
+            
+            # Not authorized - send link
             reply_msg = None
             try:
                 reply_msg = await message.reply(
@@ -1266,7 +1320,6 @@ async def cmd_post_verify(interaction: discord.Interaction, channel: discord.Tex
     )
     await channel.send(embed=license_embed(), view=LicensePanelView())
     await interaction.response.send_message(f"Posted in {channel.mention}", ephemeral=True)
-
 
 
 def _managed_role_ids() -> set[int]:
@@ -1671,7 +1724,6 @@ async def cmd_status(interaction: discord.Interaction, state: app_commands.Choic
     await interaction.response.send_message(f"→ {STATUS_MAP[state.value]}", ephemeral=True)
 
 
-
 # ----- Moderation helpers -----
 
 @bot.tree.command(name="quarantine", description="Quarantine member: strip managed roles, add quarantine role")
@@ -1801,7 +1853,6 @@ async def cmd_lookup_key(interaction: discord.Interaction, key: str):
     )
 
 
-
 @bot.tree.command(name="close_ticket", description="Close this ticket channel")
 @app_commands.describe(reason="Optional reason")
 async def cmd_close_ticket(interaction: discord.Interaction, reason: str = ""):
@@ -1842,7 +1893,6 @@ async def cmd_close_ticket(interaction: discord.Interaction, reason: str = ""):
             pass
 
 
-
 @bot.tree.command(name="ticket_panel", description="Post support ticket panel (admin)")
 async def cmd_ticket_panel(interaction: discord.Interaction, channel: discord.TextChannel | None = None):
     if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
@@ -1857,7 +1907,6 @@ async def cmd_ticket_panel(interaction: discord.Interaction, channel: discord.Te
     await interaction.response.defer(ephemeral=True)
     await ch.send(embed=ticket_panel_embed(), view=TicketPanelView())
     await interaction.followup.send(f"Panel posted in {ch.mention}", ephemeral=True)
-
 
 
 @bot.tree.command(name="purge_tickets", description="Delete open verify-* ticket channels (admin)")
@@ -1912,7 +1961,6 @@ async def cmd_userinfo(interaction: discord.Interaction, member: discord.Member)
     await interaction.response.send_message(embed=emb, ephemeral=True)
 
 
-
 @bot.tree.command(name="whitelist", description="Key seller whitelist")
 @app_commands.choices(
     action=[
@@ -1948,7 +1996,6 @@ async def cmd_whitelist(
         DATA["key_whitelist"] = [x for x in wl if x != user.id]
         save_data(DATA)
         await interaction.response.send_message(f"Removed {user.mention}", ephemeral=True)
-
 
 
 # ----- GH ban / unban / verify / webhook -----
@@ -2021,7 +2068,6 @@ async def cmd_ban(
         ("Banned." + extra) if ok else f"Fail: `{data}`",
         ephemeral=True,
     )
-
 
 
 @bot.tree.command(name="kick", description="Queue client kick for Roblox userId (mod)")
@@ -2212,7 +2258,6 @@ class SessionModView(discord.ui.View):
         await interaction.response.send_modal(
             SessionBanModal(self.key, self.roblox_name or "", self.roblox_id or "")
         )
-
 
 
 def main():
