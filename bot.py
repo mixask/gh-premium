@@ -45,6 +45,8 @@ WEBHOOKS_CHANNEL_ID = int(os.getenv("WEBHOOKS_CHANNEL_ID", "1546938830333153321"
 JOIN_LOG_CHANNEL_ID = int(os.getenv("JOIN_LOG_CHANNEL_ID", "1438999670075686912"))
 DASHBOARD_CHANNEL_ID = int(os.getenv("DASHBOARD_CHANNEL_ID", "1546940370422865930"))
 VERIFY_CMD_CHANNEL_ID = int(os.getenv("VERIFY_CMD_CHANNEL_ID", "1544375383338655754"))
+ENG_GENERAL_ID = int(os.getenv("ENG_GENERAL_ID", "1441745275268894801"))
+RU_GENERAL_ID = int(os.getenv("RU_GENERAL_ID", "1422222410454798539"))
 BAN_PASSWORD = os.getenv("BAN_PASSWORD", "")
 GREETINGS = ["Hey there", "Hi", "Wassup", "Hello", "Yo", "Hey", "Welcome", "Sup"]
 RULES_CHANNEL_ID = int(os.getenv("RULES_CHANNEL_ID", "1424116614856441856"))
@@ -526,11 +528,190 @@ class LicensePanelView(discord.ui.View):
 
 
 
+
+# ----- Support ticket panel (dropdown) -----
+TICKET_TYPES = {
+    "bug": ("bug", "Bug report", CAT_BUG_REPORT),
+    "suggestion": ("suggestion", "Suggestion", CAT_SUGGESTION),
+    "support": ("support", "Overall support", CAT_SUPPORT),
+    "request_key": ("request_key", "Request key", CAT_REQUEST_KEY),
+}
+
+
+async def open_typed_ticket(
+    guild: discord.Guild,
+    member: discord.Member,
+    kind: str,
+) -> discord.TextChannel | None:
+    """Create ticket under category for kind (bug/suggestion/support/request_key)."""
+    meta = TICKET_TYPES.get(kind)
+    if not meta:
+        return None
+    slug, label, cat_id = meta
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        member: discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, read_message_history=True, attach_files=True
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, manage_channels=True
+        ),
+    }
+    mod = guild.get_role(MOD_ROLE_ID)
+    if mod:
+        overwrites[mod] = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, manage_messages=True
+        )
+    name = f"{slug}-{member.name}"[:90].lower().replace(" ", "-")
+    category = guild.get_channel(cat_id) if cat_id else None
+    try:
+        channel = await guild.create_text_channel(
+            name,
+            overwrites=overwrites,
+            category=category if isinstance(category, discord.CategoryChannel) else None,
+            reason=f"ticket:{slug}:{member.id}",
+        )
+    except Exception as e:
+        print("[GH] open_typed_ticket", e)
+        return None
+    DATA.setdefault("pending_tickets", {})[str(channel.id)] = {
+        "user_id": member.id,
+        "kind": slug,
+        "created": int(time.time()),
+        "verified": False,
+        "close_at": None,
+    }
+    save_data(DATA)
+    if slug == "request_key":
+        msg = (
+            f"{member.mention} **Request key**\n"
+            "Describe why you need a key. Staff will respond here.\n"
+            "Use `/close_ticket` when done."
+        )
+    elif slug == "bug":
+        msg = (
+            f"{member.mention} **Bug report**\n"
+            "Describe the bug, executor, and steps to reproduce.\n"
+            "Screenshots / F9 logs help. `/close_ticket` when done."
+        )
+    elif slug == "suggestion":
+        msg = (
+            f"{member.mention} **Suggestion**\n"
+            "Write your idea clearly. Staff will review.\n"
+            "`/close_ticket` when done."
+        )
+    else:
+        msg = (
+            f"{member.mention} **Support**\n"
+            "Describe your issue.\n"
+            "Common: Application did not respond → bot restarting or down.\n"
+            "`/close_ticket` when done."
+        )
+    try:
+        await channel.send(msg)
+    except Exception:
+        pass
+    return channel
+
+
+class TicketTypeSelect(discord.ui.Select):
+    def __init__(self) -> None:
+        options = [
+            discord.SelectOption(
+                label="Bug report",
+                value="bug",
+                description="Something broken in GH / game",
+                emoji="🐛",
+            ),
+            discord.SelectOption(
+                label="Suggestion",
+                value="suggestion",
+                description="Feature idea",
+                emoji="💡",
+            ),
+            discord.SelectOption(
+                label="Overall support",
+                value="support",
+                description="General help",
+                emoji="🛠️",
+            ),
+            discord.SelectOption(
+                label="Request key",
+                value="request_key",
+                description="Ask staff for a key",
+                emoji="🔑",
+            ),
+        ]
+        super().__init__(
+            placeholder="Select ticket type...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="gh:ticket_panel:select",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Use in a server.", ephemeral=True)
+            return
+        kind = self.values[0]
+        await interaction.response.defer(ephemeral=True)
+        # one open ticket of same kind
+        for ch_id, meta in list((DATA.get("pending_tickets") or {}).items()):
+            if int(meta.get("user_id", 0)) == interaction.user.id and meta.get("kind") == kind:
+                ch = interaction.guild.get_channel(int(ch_id))
+                if ch:
+                    await interaction.followup.send(f"You already have: {ch.mention}", ephemeral=True)
+                    return
+        ch = await open_typed_ticket(interaction.guild, interaction.user, kind)
+        if not ch:
+            await interaction.followup.send("Could not create ticket (permissions?).", ephemeral=True)
+            return
+        await interaction.followup.send(f"Ticket created: {ch.mention}", ephemeral=True)
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+        self.add_item(TicketTypeSelect())
+
+
+def ticket_panel_embed() -> discord.Embed:
+    return discord.Embed(
+        title="Support tickets",
+        description=(
+            "Choose a category below.\n"
+            "• 🐛 Bug report\n"
+            "• 💡 Suggestion\n"
+            "• 🛠️ Overall support\n"
+            "• 🔑 Request key\n\n"
+            "Staff will reply in your private channel. Close with `/close_ticket`."
+        ),
+        color=0x2B6CB0,
+    )
+
+
+async def setup_ticket_panel() -> None:
+    if not TICKET_PANEL_CHANNEL_ID:
+        return
+    try:
+        ch = bot.get_channel(TICKET_PANEL_CHANNEL_ID) or await bot.fetch_channel(TICKET_PANEL_CHANNEL_ID)
+        if not isinstance(ch, discord.TextChannel):
+            return
+        async for msg in ch.history(limit=20):
+            if msg.author == bot.user and msg.embeds and "Support tickets" in (msg.embeds[0].title or ""):
+                await msg.delete()
+        await ch.send(embed=ticket_panel_embed(), view=TicketPanelView())
+    except Exception as e:
+        print("[GH] ticket panel", e)
+
+
+
 def license_embed() -> discord.Embed:
     return discord.Embed(
-        title="License & verification",
+        title="Dashboard ⚙️",
         description=(
-            "**Verify** — authorize bot (first time) or activate key\n"
+            "**🔑 Activate key** — authorize bot (first time) or activate key\n"
             "**Rewire** — move key to another Roblox account\n"
             "**Help ticket** — staff ticket only (no auto roles)\n"
             f"**Get free key** — {KEY_LINK}"
@@ -579,6 +760,7 @@ class ServerVerifyView(discord.ui.View):
 async def on_ready():
     bot.add_view(ServerVerifyView())
     bot.add_view(LicensePanelView())
+    bot.add_view(TicketPanelView())
     bot.add_view(SessionModView())
     try:
         only = os.getenv("GUILD_ID", "").strip()
@@ -598,6 +780,7 @@ async def on_ready():
         print("[GH] sync", e)
     await setup_react()
     await setup_license_panel()
+    await setup_ticket_panel()
     if not github_watcher.is_running():
         github_watcher.start()
     if not ticket_cleaner.is_running():
@@ -630,16 +813,136 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     await ensure_no_unverified_if_member(after)
 
 
+
+def _cyrillic_ratio(text: str) -> float:
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return 0.0
+    cyr = sum(1 for c in letters if "\u0400" <= c <= "\u04FF")
+    return cyr / len(letters)
+
+
+def _latin_ratio(text: str) -> float:
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return 0.0
+    lat = sum(1 for c in letters if ("a" <= c.lower() <= "z"))
+    return lat / len(letters)
+
+
+def looks_russian(text: str) -> bool:
+    """Significant Cyrillic → treat as Russian (or other Cyrillic)."""
+    if len(text.strip()) < 3:
+        return False
+    return _cyrillic_ratio(text) >= 0.35
+
+
+def looks_english_only(text: str) -> bool:
+    """Mostly Latin letters, almost no Cyrillic → English (or other Latin language)."""
+    if len(text.strip()) < 8:
+        return False
+    if _cyrillic_ratio(text) >= 0.15:
+        return False
+    return _latin_ratio(text) >= 0.55
+
+
+
+# ----- Language filter (simple heuristics) -----
+_CYR = re.compile(r"[а-яА-ЯёЁіІїЇєЄґҐ]")
+_LAT = re.compile(r"[a-zA-Z]")
+
+
+def _lang_counts(text: str) -> tuple[int, int]:
+    cyr = len(_CYR.findall(text or ""))
+    lat = len(_LAT.findall(text or ""))
+    return cyr, lat
+
+
+def detect_channel_lang_violation(channel_id: int, text: str) -> str | None:
+    """Return warning message if message language does not match channel, else None."""
+    if not text or len(text.strip()) < 4:
+        return None
+    # skip links-only / commands
+    low = text.strip().lower()
+    if low.startswith(("http://", "https://", "?", "/", "!", ".")):
+        return None
+    cyr, lat = _lang_counts(text)
+    total = cyr + lat
+    if total < 3:
+        return None
+    if channel_id == ENG_GENERAL_ID:
+        # Russian (or mostly Cyrillic) not allowed in eng
+        if cyr >= 3 and cyr >= lat:
+            return (
+                f"Please write **English** here. For Russian use <#{RU_GENERAL_ID}>."
+            )
+    elif channel_id == RU_GENERAL_ID:
+        # mostly Latin without Cyrillic → English belongs in eng
+        if lat >= 8 and cyr == 0:
+            return (
+                f"Пишите **по-русски** здесь. For English use <#{ENG_GENERAL_ID}>."
+            )
+        if lat >= 12 and cyr > 0 and lat > cyr * 3:
+            return (
+                f"Пишите **по-русски** здесь. For English use <#{ENG_GENERAL_ID}>."
+            )
+    return None
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
+    # ----- language gates: eng general / ru general -----
+    if isinstance(message.author, discord.Member) and not message.author.guild_permissions.manage_messages:
+        content = (message.content or "").strip()
+        if content and not content.startswith("http"):
+            if message.channel.id == ENG_GENERAL_ID and looks_russian(content):
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+                try:
+                    warn = await message.channel.send(
+                        f"{message.author.mention} Please write **Russian** in <#{RU_GENERAL_ID}> "
+                        f"(this channel is **English only**)."
+                    )
+                    async def _del_warn():
+                        await asyncio.sleep(20)
+                        try:
+                            await warn.delete()
+                        except Exception:
+                            pass
+                    asyncio.create_task(_del_warn())
+                except Exception as e:
+                    print("[GH] eng lang gate", e)
+                return
+            if message.channel.id == RU_GENERAL_ID and looks_english_only(content):
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+                try:
+                    warn = await message.channel.send(
+                        f"{message.author.mention} Пожалуйста, пишите **на русском** здесь. "
+                        f"English → <#{ENG_GENERAL_ID}>."
+                    )
+                    async def _del_warn2():
+                        await asyncio.sleep(20)
+                        try:
+                            await warn.delete()
+                        except Exception:
+                            pass
+                    asyncio.create_task(_del_warn2())
+                except Exception as e:
+                    print("[GH] ru lang gate", e)
+                return
+
     # ----- verify-here channel: ?verify / /verify / verify (no slash auth needed) -----
     if message.channel.id == VERIFY_CMD_CHANNEL_ID and isinstance(message.author, discord.Member):
         raw = (message.content or "").strip()
         low = raw.lower()
-        # strip common prefixes
         for prefix in ("?", "/", "!", "."):
             if low.startswith(prefix):
                 low = low[len(prefix) :].strip()
@@ -647,8 +950,9 @@ async def on_message(message: discord.Message):
         if low in ("verify", "verify me", "verification", "auth", "authorize") or low.startswith(
             "verify "
         ):
+            reply_msg = None
             try:
-                await message.reply(
+                reply_msg = await message.reply(
                     f"{message.author.mention} **Verify / authorize the bot**\n"
                     "1. Open the link (identify + guilds)\n"
                     "2. Then use **🔑 Activate key** on the license panel",
@@ -657,12 +961,20 @@ async def on_message(message: discord.Message):
                 )
             except Exception:
                 try:
-                    await message.channel.send(
+                    reply_msg = await message.channel.send(
                         f"{message.author.mention} authorize here:",
                         view=oauth_authorize_view(message.author.id),
                     )
                 except Exception as e:
                     print("[GH] verify-here reply", e)
+            if reply_msg is not None:
+                async def _delete_verify_reply(msg: discord.Message):
+                    await asyncio.sleep(300)
+                    try:
+                        await msg.delete()
+                    except Exception:
+                        pass
+                asyncio.create_task(_delete_verify_reply(reply_msg))
             return
 
     if not isinstance(message.author, discord.Member):
@@ -738,14 +1050,15 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
 
 
 async def setup_license_panel() -> None:
-    if not DASHBOARD_CHANNEL_ID or LICENSE_PANEL_CHANNEL_ID:
+    target = DASHBOARD_CHANNEL_ID or LICENSE_PANEL_CHANNEL_ID
+    if not target:
         return
     try:
-        ch = bot.get_channel(LICENSE_PANEL_CHANNEL_ID) or await bot.fetch_channel(LICENSE_PANEL_CHANNEL_ID)
+        ch = bot.get_channel(target) or await bot.fetch_channel(target)
         if not isinstance(ch, discord.TextChannel):
             return
         async for msg in ch.history(limit=15):
-            if msg.author == bot.user and msg.embeds and "License" in (msg.embeds[0].title or ""):
+            if msg.author == bot.user and msg.embeds and any(x in (msg.embeds[0].title or "") for x in ("License", "Dashboard")):
                 await msg.delete()
         await ch.send(embed=license_embed(), view=LicensePanelView())
     except Exception as e:
@@ -1156,7 +1469,7 @@ async def cmd_oauth_status(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="license_panel", description="Post license panel to dashboard (admin)")
+@bot.tree.command(name="license_panel", description="Post Dashboard ⚙️ panel (admin)")
 async def cmd_license_panel(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
         await interaction.response.send_message("Admin only.", ephemeral=True)
@@ -1401,6 +1714,65 @@ async def cmd_lookup_key(interaction: discord.Interaction, key: str):
         f"```json\n{json.dumps(data, indent=2)[:1800]}\n```",
         ephemeral=True,
     )
+
+
+
+@bot.tree.command(name="close_ticket", description="Close this ticket channel")
+@app_commands.describe(reason="Optional reason")
+async def cmd_close_ticket(interaction: discord.Interaction, reason: str = ""):
+    if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("Use in a ticket text channel.", ephemeral=True)
+        return
+    ch = interaction.channel
+    meta = (DATA.get("pending_tickets") or {}).get(str(ch.id))
+    is_ticket = bool(meta) or (ch.name or "").startswith(("verify-", "help-", "ticket-"))
+    if not is_ticket:
+        await interaction.response.send_message("This is not a tracked ticket channel.", ephemeral=True)
+        return
+    member = interaction.user
+    if not isinstance(member, discord.Member):
+        await interaction.response.send_message("Server only.", ephemeral=True)
+        return
+    owner_id = int((meta or {}).get("user_id") or 0)
+    allowed = (
+        is_mod(member)
+        or is_admin(member)
+        or (owner_id and member.id == owner_id)
+        or member.guild_permissions.manage_channels
+    )
+    if not allowed:
+        await interaction.response.send_message("Only ticket owner or staff can close.", ephemeral=True)
+        return
+    await interaction.response.send_message("Closing ticket…")
+    if meta:
+        DATA.get("pending_tickets", {}).pop(str(ch.id), None)
+        save_data(DATA)
+    why = reason.strip() or f"Closed by {member}"
+    try:
+        await ch.delete(reason=why[:400])
+    except Exception as e:
+        try:
+            await interaction.followup.send(f"Could not delete: `{e}`")
+        except Exception:
+            pass
+
+
+
+@bot.tree.command(name="ticket_panel", description="Post support ticket panel (admin)")
+async def cmd_ticket_panel(interaction: discord.Interaction, channel: discord.TextChannel | None = None):
+    if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    ch = channel
+    if ch is None and interaction.guild:
+        ch = interaction.guild.get_channel(TICKET_PANEL_CHANNEL_ID)  # type: ignore
+    if ch is None or not isinstance(ch, discord.TextChannel):
+        await interaction.response.send_message("Channel not found.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await ch.send(embed=ticket_panel_embed(), view=TicketPanelView())
+    await interaction.followup.send(f"Panel posted in {ch.mention}", ephemeral=True)
+
 
 
 @bot.tree.command(name="purge_tickets", description="Delete open verify-* ticket channels (admin)")
